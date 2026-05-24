@@ -1,0 +1,16 @@
+spread_bps: 3
+impact_coeff: 0.10
+borrow_cost_easy_bps: 0
+borrow_cost_medium_bps: 150
+borrow_cost_hard_bps: 300
+max_position_adv_fraction: 0.01
+gross_exposure_target: 1.0
+max_single_position: 0.05
+max_gross: 2.0
+aum_dollars: 100000000   # $100M reference AUM for AC impact cost scaling
+min_adv_dollars: 1000000  # $1M minimum ADV filter (excludes bankrupt/delisted stocks)
+rebalancing_frequencies: [1, 5, 21]
+implementation_lag_days: 1
+sensitivity_spread_bps: [1, 3, 5, 7, 10]
+sensitivity_impact_coeff: [0.05, 0.10, 0.15, 0.20]
+turnover_lambdas: [0.0, 0.001, 0.005, 0.010, 0.050]

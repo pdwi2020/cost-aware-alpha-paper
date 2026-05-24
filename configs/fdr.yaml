@@ -1,0 +1,14 @@
+fdr_q: 0.05
+bootstrap_samples: 1000
+bootstrap_block_length: 21
+cscv_splits: 16
+pbo_target: 0.30
+vix_calm_threshold: 20
+walkforward_warmup_years: 3
+walkforward_step_years: 1
+train_end: "2021-12-31"
+true_holdout_start: "2022-01-01"
+true_holdout_end: "2024-12-31"
+universe_start: "2010-01-01"
+min_market_cap_bn: 1.0
+min_adv_mm: 5.0

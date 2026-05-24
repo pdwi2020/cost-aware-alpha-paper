@@ -1,0 +1,58 @@
+# Large data files — stay on X9 drive
+data/processed/*.parquet
+data/processed/*.csv
+data/processed/*.feather
+data/processed/*.pkl
+data/processed/*.h5
+data/processed/*.hdf5
+
+# Symlinks to X9 (dangling on other machines)
+data/equity_ohlcv_1m_us
+data/fama_french_factors
+data/fred_macro
+data/polymarket_features
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+*.env
+
+# macOS
+.DS_Store
+._*
+**/._*
+
+# X9 symlink directories (dangling on other machines)
+datasets/
+
+# Env example
+.env
+.env.example
+compute/._*
+configs/._*
+notebooks/._*
+src/._*
+references/._*
+paper/._*
+data/._*
