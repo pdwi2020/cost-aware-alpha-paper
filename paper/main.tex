@@ -251,29 +251,42 @@ crowding dynamics.
 Our universe consists of all tickers that appeared in the S\&P~500
 annual constituent lists for at least one year from 2010 to 2024,
 yielding 674~unique tickers.
+Point-in-time membership is constructed from annual SPDR S\&P~500
+ETF Trust (SPY) holdings snapshots sourced from a publicly available
+Kaggle dataset covering 2000--2024~\citep{kaggle_spy2024}.
+Only tickers present in the S\&P~500 at the beginning of each
+calendar year are eligible for signals in that year, preventing
+survivorship bias.
 We apply a minimum average-daily-dollar-volume filter of
 \$1\,million to exclude bankrupt and near-zero-liquidity stocks from
 portfolio construction.
 After filtering, 635~tickers are active during the in-sample period
 (2013--2021) and 650 during the out-of-sample period (2022--2024).
-Point-in-time membership is used to prevent survivorship bias:
-only tickers present in the S\&P~500 at the beginning of each year
-are eligible for signals in that year.
 
 \subsection{Price Data}
-One-minute OHLCV bars (1992--2024) from a proprietary data lake are
-aggregated to daily close-to-close returns in the
-America/New\_York~timezone to prevent the well-known UTC-offset
-artifact in overnight return attribution.
-The resulting daily OHLCV file covers 2,157,444~rows.
+Daily open/high/low/close/volume (OHLCV) data for all universe
+tickers over 2010--2024 were obtained via the Yahoo Finance API
+using the \texttt{yfinance} Python library~\citep{yfinance}.
+Returns are computed as close-to-close daily percentage changes.
+The resulting panel covers 2,157,444~stock-day observations across
+661~unique tickers.\footnote{A candidate set of Polymarket
+prediction market features (aggregate sentiment across 615\,000
+binary contracts) was evaluated during feature screening but did not
+survive Tier~1 signal filtering; no prediction market variables
+enter the final feature set.}
 
 \subsection{Factor and Macro Data}
 Fama-French five-factor~(FF5) and momentum~(UMD) returns are
-obtained from the Kenneth French data library and used for both
+obtained from the Kenneth French Data
+Library~\citep{french_data_library} and used for both
 factor-model residualisation (Track~A target) and as control
 variables.
-Macroeconomic series~(VIXCLS, T10Y2Y term spread, DXY dollar index,
-WTI crude, DGS10 ten-year yield) are downloaded from FRED.
+Macroeconomic series --- VIX level~(VIXCLS), 10Y--2Y Treasury
+term spread~(T10Y2Y), and the trade-weighted US Dollar
+index~(DTWEXBGS) --- are downloaded from the Federal Reserve Bank
+of St.\ Louis FRED database~\citep{fred2024}.
+All data sources are publicly available and free of charge,
+ensuring full reproducibility of the empirical pipeline.
 
 \subsection{In-Sample / Out-of-Sample Split}
 We follow a strict pre-registration discipline:
