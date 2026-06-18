@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.backtest.portfolio import PortfolioSimulator
-from src.backtest.run_backtest import build_returns_vol_adv
+from src.backtest.run_backtest import build_returns_vol_adv, apply_min_price_filter
 
 SIG_A_PATH = ROOT / "data" / "processed" / "signals_track_a.parquet"
 SIG_B_PATH = ROOT / "data" / "processed" / "signals_track_b.parquet"
@@ -55,6 +55,7 @@ def run_scenario(
     signal_df, returns, vol, adv_dollars,
     spread_bps, impact_coeff, rebal_freq,
     aum_dollars, track, min_adv_dollars=1e6,
+    close_w=None,
 ) -> dict:
     sim = PortfolioSimulator(
         config_path=str(CFG_PATH),
@@ -62,6 +63,9 @@ def run_scenario(
         impact_coeff=impact_coeff,
     )
     positions = sim.signal_to_positions(signal_df, lag=1, rebal_freq=rebal_freq)
+    # Screen 0: exclude penny stocks (price < $5) on trade date
+    if close_w is not None:
+        positions = apply_min_price_filter(positions, close_w)
     pnl_df    = sim.simulate_pnl(positions, returns, vol=vol,
                                   adv_dollars=adv_dollars, aum_dollars=aum_dollars,
                                   min_adv_dollars=min_adv_dollars)
@@ -100,7 +104,7 @@ def main():
 
         signal_df = pd.read_parquet(sig_path)
         tickers   = signal_df.columns.tolist()
-        returns, vol, adv_dollars_df = build_returns_vol_adv(
+        returns, vol, adv_dollars_df, close_px = build_returns_vol_adv(
             ohlcv, tickers, BACKTEST_START, BACKTEST_END
         )
 
@@ -113,6 +117,7 @@ def main():
                     signal_df, returns, vol, adv_dollars_df,
                     sp, ic, rebal_freq, aum_dollars, track,
                     min_adv_dollars=min_adv_dollars,
+                    close_w=close_px,
                 )
                 all_rows.append(row)
 

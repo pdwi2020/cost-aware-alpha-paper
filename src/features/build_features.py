@@ -4,13 +4,32 @@ Loads daily OHLCV (cached), builds 16 classic alpha features,
 computes Track A (FF5+Mom residualized) and Track B (raw) 5-day
 forward return targets, and saves the merged matrix.
 
+SANITIZATION (±50% return cap):
+    Corporate-action artifacts (unadjusted splits, bad ticks) in the
+    S&P-500 universe produce impossible single-day moves (>±50%).  These
+    contaminate every return-derived feature (ret_1d/5d/21d/63d,
+    reversal_1w/4w) and both targets.
+
+    Sanitization approach (mirrors run_baselines.py::build_clean_prices):
+      1. For each ticker, compute raw daily returns r = close.pct_change()
+      2. Clip to ±SANITIZE_CAP  (default 0.50 = ±50%)
+      3. Reconstruct close_clean = first_close × cumprod(1 + r_clean)
+      4. Replace `close` in the OHLCV panel with close_clean before all
+         downstream feature and target computation.
+
+    The original `close` column is preserved for dollar-volume (ADV) so
+    that liquidity filtering is not distorted by the reconstruction.
+    Pass --no-sanitize to reproduce the original raw behavior.
+
 Output: data/processed/features_tier1.parquet
         data/processed/daily_ohlcv.parquet  (cache)
 
 Run directly:
     cd ~/ML_Paper && python3 src/features/build_features.py
+    cd ~/ML_Paper && python3 src/features/build_features.py --no-sanitize
 """
 
+import argparse
 import os
 import sys
 import time
@@ -36,6 +55,93 @@ UNIVERSE_START = "2010-01-01"
 UNIVERSE_END   = "2024-12-31"
 FACTOR_WINDOW  = 252   # rolling OLS window (trading days) for beta estimation
 FWD_HORIZON    = 5     # 5-day forward return target
+
+# ±50% daily return cap for corporate-action artifact removal.
+# Set to None (or pass --no-sanitize) to reproduce original raw behavior.
+SANITIZE_CAP = 0.50
+
+
+# ---------------------------------------------------------------------------
+# Price sanitization helpers
+# ---------------------------------------------------------------------------
+
+def build_clean_prices_wide(
+    close_w: pd.DataFrame,
+    cap: float,
+) -> tuple:
+    """Reconstruct a clean price series by cumulatively compounding clipped returns.
+
+    Mirrors run_baselines.py::build_clean_prices exactly.
+
+    Parameters
+    ----------
+    close_w : (date × ticker) raw close prices
+    cap     : symmetric absolute cap (e.g. 0.50 = ±50%)
+
+    Returns
+    -------
+    close_clean : (date × ticker) cleaned price proxy, same shape as close_w
+    n_clipped   : int, number of (ticker, day) cells clipped
+    """
+    r_raw = close_w.pct_change(fill_method=None)
+    n_clipped = int((r_raw.abs() > cap).sum().sum())
+
+    r_clean = r_raw.clip(lower=-cap, upper=cap)
+
+    # Reconstruct: start from the first valid close level per ticker,
+    # then compound the cleaned returns forward.
+    first_close = close_w.iloc[0]                         # Series (ticker → price)
+    growth = (1.0 + r_clean.fillna(0.0)).cumprod()        # (date × ticker)
+    close_clean = growth.multiply(first_close, axis="columns")
+    # Restore NaN where original close was NaN (listing gap, delisting)
+    close_clean[close_w.isna()] = np.nan
+
+    return close_clean, n_clipped
+
+
+def sanitize_ohlcv(daily: pd.DataFrame, cap: float) -> pd.DataFrame:
+    """Replace the `close` column in OHLCV with the sanitized price proxy.
+
+    The original `close` is preserved under `close_raw` so that ADV
+    computations (which use close × volume) remain on the original scale
+    and are not distorted by the price reconstruction.
+
+    Parameters
+    ----------
+    daily : long-format OHLCV DataFrame with columns [ticker, date, close, ...]
+    cap   : return cap (default SANITIZE_CAP = 0.50)
+
+    Returns
+    -------
+    Sanitized OHLCV DataFrame (close → close_clean; close_raw added)
+    """
+    daily = daily.copy()
+    daily["date"] = pd.to_datetime(daily["date"])
+
+    # Wide close panel: date × ticker
+    close_w = daily.pivot(index="date", columns="ticker", values="close")
+
+    close_clean_w, n_clipped = build_clean_prices_wide(close_w, cap)
+    print(f"\n  [sanitize_ohlcv] Clipped {n_clipped:,} (ticker,day) cells "
+          f"with |raw_ret| > {cap:.0%} to ±{cap:.0%}")
+
+    # Long-format clean close
+    clean_long = (
+        close_clean_w
+        .stack(future_stack=True)
+        .rename("close_clean")
+        .reset_index()
+    )
+    clean_long.columns = ["date", "ticker", "close_clean"]
+    clean_long["date"] = pd.to_datetime(clean_long["date"])
+
+    # Merge back, rename original close → close_raw, set close = close_clean
+    daily = daily.merge(clean_long, on=["ticker", "date"], how="left")
+    daily.rename(columns={"close": "close_raw"}, inplace=True)
+    daily.rename(columns={"close_clean": "close"}, inplace=True)
+
+    print(f"  [sanitize_ohlcv] Sanitized OHLCV shape: {daily.shape}")
+    return daily
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +259,22 @@ def compute_track_a(
 # ---------------------------------------------------------------------------
 
 def main() -> pd.DataFrame:
+    parser = argparse.ArgumentParser(description="Week 2: Tier 1 Feature Engineering")
+    parser.add_argument(
+        "--no-sanitize", action="store_true",
+        help="Disable ±50%% return-cap sanitization (reproduce original raw behavior)"
+    )
+    args = parser.parse_args()
+    sanitize = not args.no_sanitize
+    cap = SANITIZE_CAP if sanitize else None
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUT_DIR / "features_tier1.parquet"
 
-    print("=== Week 2: Tier 1 Feature Engineering ===\n")
+    if sanitize:
+        print(f"=== Week 2: Tier 1 Feature Engineering  [SANITIZE_CAP=±{cap:.0%}] ===\n")
+    else:
+        print("=== Week 2: Tier 1 Feature Engineering  [RAW — no sanitization] ===\n")
 
     db = duckdb.connect(CATALOG, read_only=True)
 
@@ -168,11 +286,29 @@ def main() -> pd.DataFrame:
     daily = load_daily_ohlcv(db, sp500_tickers)
     print(f"Daily OHLCV: {daily.shape}  ({daily['ticker'].nunique()} tickers)")
 
-    # 3. Factors + macro
+    # 3. Sanitize prices BEFORE any feature computation
+    #    This replaces the `close` column with close_clean (cumproduct of clipped returns).
+    #    tier1_classic.py::build_tier1_features() and compute_track_b/a() both read
+    #    `close` from the OHLCV, so a single replacement here cleans all downstream
+    #    return-derived features AND both targets coherently.
+    if sanitize:
+        daily = sanitize_ohlcv(daily, cap)
+        # Count residual artifacts for verification
+        close_w_chk = daily.pivot(index="date", columns="ticker", values="close")
+        r_chk = close_w_chk.pct_change(fill_method=None)
+        n_residual = int((r_chk.abs() > cap).sum().sum())
+        print(f"  [verify] Residual |ret|>{cap:.0%} cells after sanitization: {n_residual}")
+        if n_residual > 0:
+            print(f"  [WARN] Non-zero residuals — check for extreme close[t=0] values or NaN gaps")
+    else:
+        print("  Price sanitization DISABLED (raw mode)")
+
+    # 4. Factors + macro
     factors = load_factors(db)
     macro   = load_macro(db)
 
-    # 4. Build Tier 1 features (MultiIndex ticker, date)
+    # 5. Build Tier 1 features (MultiIndex ticker, date)
+    #    Uses sanitized `close` (or raw, if --no-sanitize)
     prices_mi = daily.set_index(["ticker", "date"]).sort_index()
     vix    = macro["vix"]
     spread = macro["term_spread_2s10s"]
@@ -182,19 +318,19 @@ def main() -> pd.DataFrame:
     features = build_tier1_features(prices_mi, factors, vix, spread)
     print(f"  Done in {time.time()-t0:.0f}s  →  {features.shape}")
 
-    # 5. Wide close panel for target computation
+    # 6. Wide close panel for target computation (uses sanitized close)
     close_wide = daily.pivot(index="date", columns="ticker", values="close")
     close_wide.index = pd.to_datetime(close_wide.index)
 
-    # 6. Track B: raw 5-day forward return
-    print("\nComputing Track B (raw 5d forward return)...")
+    # 7. Track B: 5-day forward return (from sanitized close)
+    print("\nComputing Track B (5d forward return, sanitized close)...")
     track_b = compute_track_b(close_wide)           # date × ticker
 
-    # 7. Track A: FF5+Mom residualized 5-day forward return
-    print("\nComputing Track A (idiosyncratic 5d forward return)...")
+    # 8. Track A: FF5+Mom residualized 5-day forward return (from sanitized close)
+    print("\nComputing Track A (idiosyncratic 5d forward return, sanitized close)...")
     track_a = compute_track_a(close_wide, factors)  # date × ticker
 
-    # 8. Stack targets to long format
+    # 9. Stack targets to long format
     def _to_long(wide: pd.DataFrame, col: str) -> pd.DataFrame:
         long = wide.stack(future_stack=True).rename(col).reset_index()
         long.columns = ["date", "ticker", col]
@@ -204,19 +340,29 @@ def main() -> pd.DataFrame:
     track_b_long = _to_long(track_b, "target_track_b")
     track_a_long = _to_long(track_a, "target_track_a")
 
-    # 9. Merge features + targets
+    # 10. Merge features + targets
     feat_df = features.reset_index()
     out = feat_df.merge(track_b_long, on=["ticker", "date"], how="left")
     out = out.merge(track_a_long,    on=["ticker", "date"], how="left")
     out = out.set_index(["ticker", "date"]).sort_index()
 
-    # 10. Filter to universe window; drop all-NaN feature rows (burn-in)
+    # 11. Filter to universe window; drop all-NaN feature rows (burn-in)
     feat_cols = [c for c in out.columns if c.startswith("target") is False]
     out = out.loc[
         (out.index.get_level_values("date") >= UNIVERSE_START) &
         (out.index.get_level_values("date") <= UNIVERSE_END)
     ]
     out = out.dropna(subset=feat_cols, how="all")
+
+    # --- Artifact count report (before = raw bak, after = this run) ---
+    ret_feats_chk = ['ret_1d','ret_5d','ret_21d','ret_63d','reversal_1w','reversal_4w']
+    tgt_chk = ['target_track_a','target_track_b']
+    print(f"\n=== Sanitization Verification ===")
+    print(f"{'Feature':<25s}  {'|val|>50% count':>17s}")
+    for c in ret_feats_chk + tgt_chk:
+        if c in out.columns:
+            n = int((out[c].abs() > 0.50).sum())
+            print(f"  {c:<23s}  {n:>15,}")
 
     # --- Summary ---
     dates = out.index.get_level_values("date")

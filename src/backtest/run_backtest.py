@@ -51,6 +51,29 @@ VOL_WINDOW = 21   # days for rolling vol
 def log(msg): print(msg, flush=True)
 
 
+SANITIZE_CAP = 0.50   # ±50% return cap, mirrors build_features.py and run_baselines.py
+
+# Screen 0 — tradeable-universe filter (matches run_holdout.py verbatim)
+MIN_PRICE = 5.0
+
+
+def apply_min_price_filter(positions, close_w, min_price=MIN_PRICE):
+    """Screen 0: zero positions in names priced < min_price on the trade date,
+    then renormalise gross (L1) leverage to 1 per day."""
+    pxa = close_w.reindex(index=positions.index, columns=positions.columns).ffill()
+    positions = positions.where(pxa >= min_price, 0.0)
+    l1 = positions.abs().sum(axis=1).replace(0, np.nan)
+    return positions.div(l1, axis=0).fillna(0.0)
+
+
+def _clip_returns(ret_df: pd.DataFrame, cap: float) -> pd.DataFrame:
+    """Clip daily returns to ±cap, log how many cells were affected."""
+    n_clipped = int((ret_df.abs() > cap).sum().sum())
+    if n_clipped > 0:
+        log(f"  [sanitize] Clipped {n_clipped} (ticker,day) cells with |ret|>{cap:.0%}")
+    return ret_df.clip(lower=-cap, upper=cap)
+
+
 def build_returns_vol_adv(
     ohlcv: pd.DataFrame,
     tickers: list,
@@ -59,10 +82,14 @@ def build_returns_vol_adv(
 ) -> tuple:
     """Build daily returns, rolling vol, and ADV from OHLCV.
 
+    Returns are sanitized (±50% cap) to remove corporate-action artifacts.
+    ADV denominator uses the raw close × volume (dollar-volume scale preserved).
+
     Returns:
-        returns    : (date × ticker) daily close-to-close returns
+        returns    : (date × ticker) daily close-to-close returns (sanitized)
         vol        : (date × ticker) 21-day rolling return std
         adv_dollars: (date × ticker) 21-day rolling dollar volume
+        close_w    : (date × ticker) raw close price matrix (for Screen 0)
     """
     # Filter tickers and date range
     mask = (
@@ -76,19 +103,20 @@ def build_returns_vol_adv(
     close_w  = sub.pivot(index="date", columns="ticker", values="close")
     volume_w = sub.pivot(index="date", columns="ticker", values="volume")
 
-    # Daily returns
-    returns = close_w.pct_change()
+    # Daily returns — sanitize to ±50% to remove corporate-action artifacts
+    returns_raw = close_w.pct_change(fill_method=None)
+    returns = _clip_returns(returns_raw, SANITIZE_CAP)
 
     # Rolling vol (std of returns)
     vol = returns.rolling(VOL_WINDOW, min_periods=10).std()
 
-    # ADV in dollars (21-day rolling mean of close × volume)
+    # ADV in dollars (21-day rolling mean of close × volume; uses raw close scale)
     dollar_vol   = close_w * volume_w
     adv_dollars  = dollar_vol.rolling(VOL_WINDOW, min_periods=10).mean()
 
     # Restrict to backtest window
     ret_mask = (returns.index >= pd.Timestamp(start)) & (returns.index <= pd.Timestamp(end))
-    return returns[ret_mask], vol[ret_mask], adv_dollars[ret_mask]
+    return returns[ret_mask], vol[ret_mask], adv_dollars[ret_mask], close_w[ret_mask]
 
 
 def run_single_backtest(
@@ -102,6 +130,7 @@ def run_single_backtest(
     track: str,
     aum_dollars: float = 1e8,
     min_adv_dollars: float = 1e6,
+    close_w: pd.DataFrame | None = None,
 ) -> dict:
     """Run one scenario: build positions, simulate P&L, compute metrics."""
     sim = PortfolioSimulator(
@@ -110,6 +139,9 @@ def run_single_backtest(
         impact_coeff=impact_coeff,
     )
     positions = sim.signal_to_positions(signal_df, lag=1)
+    # Screen 0: exclude penny stocks (price < $5) on trade date
+    if close_w is not None:
+        positions = apply_min_price_filter(positions, close_w)
     pnl_df    = sim.simulate_pnl(positions, returns, vol=vol,
                                   adv_dollars=adv_dollars, aum_dollars=aum_dollars,
                                   min_adv_dollars=min_adv_dollars)
@@ -167,7 +199,7 @@ def main():
         log(f"  Signal: {signal_df.shape[0]} dates × {signal_df.shape[1]} tickers")
 
         tickers = signal_df.columns.tolist()
-        returns, vol, adv_dollars = build_returns_vol_adv(
+        returns, vol, adv_dollars, close_px = build_returns_vol_adv(
             ohlcv, tickers, BACKTEST_START, BACKTEST_END
         )
         log(f"  Returns: {returns.shape[0]} dates, vol NaN={vol.isna().mean().mean():.3f}")
@@ -178,6 +210,7 @@ def main():
             signal_df, returns, vol, adv_dollars,
             spread_bps=base_spread, impact_coeff=base_impact,
             cfg_path=CFG_PATH, track=track, aum_dollars=aum_dollars,
+            close_w=close_px,
         )
         print_metrics(base, f"Base case — {track.upper()}")
         base_results.append({k: v for k, v in base.items() if k != "_pnl_df"})
@@ -189,6 +222,7 @@ def main():
                 signal_df, returns, vol, adv_dollars,
                 spread_bps=sp, impact_coeff=ic,
                 cfg_path=CFG_PATH, track=track, aum_dollars=aum_dollars,
+                close_w=close_px,
             )
             sens_rows.append({k: v for k, v in res.items() if k != "_pnl_df"})
 

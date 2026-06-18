@@ -28,12 +28,14 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-FDR_PATH  = ROOT / "data" / "processed" / "fdr_results.parquet"
-SHAP_PATH = ROOT / "data" / "processed" / "shap_summary.parquet"
-FEAT_PATH = ROOT / "data" / "processed" / "features_all.parquet"
+from src.universe_paths import proc
 
-OUT_A = ROOT / "data" / "processed" / "signals_track_a.parquet"
-OUT_B = ROOT / "data" / "processed" / "signals_track_b.parquet"
+FDR_PATH  = proc(ROOT, "fdr_results.parquet")
+SHAP_PATH = proc(ROOT, "shap_summary.parquet")
+FEAT_PATH = proc(ROOT, "features_all.parquet")
+
+OUT_A = proc(ROOT, "signals_track_a.parquet")
+OUT_B = proc(ROOT, "signals_track_b.parquet")
 
 
 def log(msg): print(msg, flush=True)

@@ -1,5 +1,9 @@
 # Key References — ML Paper
 
+> **See [`LITERATURE_REVIEW.md`](LITERATURE_REVIEW.md)** for the full referee-grade
+> literature review (gap threads G1–G8, per-paper analysis, and the gap→`main.tex`
+> insertion-point map). Downloaded PDFs + status are in [`pdfs/MANIFEST.md`](pdfs/MANIFEST.md).
+
 ## Core Papers
 
 | # | Authors | Year | Title | Venue | Link |

@@ -1,0 +1,27 @@
+{
+  "title": "CAVAL: A Cost-Aware Validation System for Tradable-Alpha Discovery with False Discovery Rate Control",
+  "description": "Reproducible code, configurations, and processed-data artifacts for the CAVAL five-screen validation protocol: a data-integrity pre-screen (Screen 0), Benjamini-Hochberg FDR control, a permutation-calibrated Tradable-Alpha FDR test, an Alpha Robustness Volume cost-robustness metric, and a single-touch locked out-of-sample evaluation with PBO/CSCV, Deflated Sharpe Ratio, and conformal calibration. Applied to a survivorship-bias-free S&P 500 universe (2010-2024).",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "Dwivedi, Paritosh",
+      "affiliation": "Vellore Institute of Technology"
+    },
+    {
+      "name": "Lakshmanan, Ramanathan",
+      "affiliation": "Vellore Institute of Technology",
+      "orcid": "0000-0002-1532-5495"
+    }
+  ],
+  "keywords": [
+    "algorithmic trading",
+    "false discovery rate",
+    "market impact",
+    "Almgren-Chriss",
+    "backtest overfitting",
+    "conformal prediction",
+    "walk-forward cross-validation"
+  ]
+}

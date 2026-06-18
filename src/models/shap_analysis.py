@@ -33,11 +33,12 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.models.model_suite import make_fold_dates, preprocess
+from src.universe_paths import proc
 
-FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
+FEATURES_PATH = proc(ROOT, "features_all.parquet")
 CONFIG_PATH   = ROOT / "configs" / "models.yaml"
-OUT_FOLD      = ROOT / "data" / "processed" / "shap_by_fold.parquet"
-OUT_SUMMARY   = ROOT / "data" / "processed" / "shap_summary.parquet"
+OUT_FOLD      = proc(ROOT, "shap_by_fold.parquet")
+OUT_SUMMARY   = proc(ROOT, "shap_summary.parquet")
 
 N_SHAP = 2000  # test rows sampled for SHAP (speed vs accuracy trade-off)
 SEED   = 42

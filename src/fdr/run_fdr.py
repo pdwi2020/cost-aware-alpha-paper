@@ -36,11 +36,12 @@ sys.path.insert(0, str(ROOT))
 
 from src.models.model_suite import make_fold_dates
 from src.fdr.bh_correction import compute_ic_tstats, benjamini_hochberg, bh_with_regime
+from src.universe_paths import proc
 
-FEATURES_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
-SHAP_PATH      = ROOT / "data" / "processed" / "shap_summary.parquet"
-OUT_RESULTS    = ROOT / "data" / "processed" / "fdr_results.parquet"
-OUT_REGIME     = ROOT / "data" / "processed" / "fdr_regime.parquet"
+FEATURES_PATH  = proc(ROOT, "features_all.parquet")
+SHAP_PATH      = proc(ROOT, "shap_summary.parquet")
+OUT_RESULTS    = proc(ROOT, "fdr_results.parquet")
+OUT_REGIME     = proc(ROOT, "fdr_regime.parquet")
 
 FDR_Q          = 0.10
 VIX_CALM_THRESH = 20.0

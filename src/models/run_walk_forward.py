@@ -22,9 +22,10 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from src.models.model_suite import ModelSuite, make_fold_dates
+from src.universe_paths import proc
 
-FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
-OUT_PATH      = ROOT / "data" / "processed" / "ic_by_fold.parquet"
+FEATURES_PATH = proc(ROOT, "features_all.parquet")
+OUT_PATH      = proc(ROOT, "ic_by_fold.parquet")
 CONFIG_PATH   = ROOT / "configs" / "models.yaml"
 
 

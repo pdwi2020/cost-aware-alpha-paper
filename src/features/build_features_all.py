@@ -4,11 +4,18 @@ Loads Tier 1 from parquet, computes Tier 2 features (intraday microstructure,
 cross-asset macro, crowding proxies), adds the term_spread × mom_12_1
 interaction term, merges, and saves features_all.parquet.
 
+SANITIZATION NOTE:
+    Tier-1 features (including return-derived columns and both targets) are
+    already sanitized if features_tier1.parquet was built with build_features.py
+    (default mode, ±50% cap).
+    This script also sanitizes the close prices passed to build_tier2_features()
+    so that overnight_gap uses the same artifact-free price series.
+
 Run directly:
     cd ~/ML_Paper && python3 src/features/build_features_all.py
 
 Prerequisites:
-    data/processed/features_tier1.parquet  (from build_features.py)
+    data/processed/features_tier1.parquet  (from build_features.py --sanitize)
     data/processed/daily_ohlcv.parquet     (from build_features.py)
 """
 
@@ -28,6 +35,46 @@ load_dotenv(ROOT / ".env")
 
 from src.data.universe_builder import get_universe_tickers
 from src.features.tier2_extended import build_tier2_features
+
+# ±50% daily return cap for corporate-action artifact removal in Tier-2 features.
+# Must match build_features.py SANITIZE_CAP for full coherence.
+SANITIZE_CAP_T2 = 0.50
+
+
+def _sanitize_ohlcv_for_tier2(daily: pd.DataFrame, cap: float) -> pd.DataFrame:
+    """Replace `close` in OHLCV with a sanitized proxy for Tier-2 feature building.
+
+    Used specifically for overnight_gap (open_T / close_{T-1} - 1) in Tier-2.
+    The original `close` is replaced with close_clean = first × cumprod(1 + r_clean)
+    where r_clean = clip(pct_change(close), -cap, +cap).
+
+    ADV / dollar-volume computations in crowding features also use close × volume,
+    but those are structural features (not return-derived) so raw close is acceptable;
+    however sanitized close is also fine since the change is small.
+    """
+    daily = daily.copy()
+    close_w = daily.pivot(index="date", columns="ticker", values="close")
+    r_raw = close_w.pct_change(fill_method=None)
+    n_clipped = int((r_raw.abs() > cap).sum().sum())
+    if n_clipped > 0:
+        print(f"  [T2 sanitize] Clipping {n_clipped} (ticker,day) cells with |ret|>{cap:.0%}")
+    r_clean = r_raw.clip(lower=-cap, upper=cap)
+    first_close = close_w.iloc[0]
+    growth = (1.0 + r_clean.fillna(0.0)).cumprod()
+    close_clean_w = growth.multiply(first_close, axis="columns")
+    close_clean_w[close_w.isna()] = np.nan
+
+    # Long-format merge
+    cc_long = (
+        close_clean_w.stack(future_stack=True)
+        .rename("close_clean")
+        .reset_index()
+    )
+    cc_long.columns = ["date", "ticker", "close_clean"]
+    cc_long["date"] = pd.to_datetime(cc_long["date"])
+    daily = daily.merge(cc_long, on=["ticker", "date"], how="left")
+    daily.rename(columns={"close": "close_raw", "close_clean": "close"}, inplace=True)
+    return daily
 
 CATALOG      = os.environ.get("DUCKDB_CATALOG", "/Volumes/Crucial X9/data/catalog.duckdb")
 SP500_DIR    = ROOT / "datasets" / "sp500_holdings"
@@ -59,11 +106,16 @@ def main() -> pd.DataFrame:
 
     # ------------------------------------------------------------------
     # 2. Load daily OHLCV (for overnight gap + crowding base)
+    #    Sanitize close prices for Tier-2 feature building so overnight_gap
+    #    uses the same artifact-free price series as Tier-1 features.
     # ------------------------------------------------------------------
     print("Loading daily OHLCV...")
     daily = pd.read_parquet(OHLCV_PATH)
     daily["date"] = pd.to_datetime(daily["date"])
     print(f"  OHLCV shape: {daily.shape}")
+    print(f"  Sanitizing OHLCV for Tier-2 (cap=±{SANITIZE_CAP_T2:.0%}) ...")
+    daily = _sanitize_ohlcv_for_tier2(daily, SANITIZE_CAP_T2)
+    print(f"  Sanitized OHLCV shape: {daily.shape}")
 
     # ------------------------------------------------------------------
     # 3. SP500 universe tickers

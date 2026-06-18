@@ -1,4 +1,4 @@
-fdr_q: 0.05
+fdr_q: 0.10          # BH target FDR level (matches run_fdr.py and the manuscript)
 bootstrap_samples: 1000
 bootstrap_block_length: 21
 cscv_splits: 16

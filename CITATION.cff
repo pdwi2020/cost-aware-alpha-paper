@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+title: >-
+  CAVAL: A Cost-Aware Validation System for Tradable-Alpha
+  Discovery with False Discovery Rate Control
+message: >-
+  If you use this software or its methodology, please cite both
+  the software (this record) and the associated paper.
+type: software
+authors:
+  - given-names: Paritosh
+    family-names: Dwivedi
+    affiliation: Vellore Institute of Technology
+    email: paritosh.dwivedi2024@vitstudent.ac.in
+  - given-names: Ramanathan
+    family-names: Lakshmanan
+    affiliation: Vellore Institute of Technology
+    email: lramanathan@vit.ac.in
+    orcid: 'https://orcid.org/0000-0002-1532-5495'
+repository-code: 'https://github.com/pdwi2020/cost-aware-alpha-paper'
+abstract: >-
+  CAVAL is a modular expert-system pipeline that admits an equity
+  long-short signal only if it clears a data-integrity pre-screen
+  (Screen 0) and four sequential validation screens: Benjamini-Hochberg
+  false-discovery-rate control, a permutation-calibrated Tradable-Alpha
+  FDR test, an Alpha Robustness Volume cost-robustness metric, and a
+  single-touch locked out-of-sample evaluation with PBO/CSCV and
+  Deflated-Sharpe-Ratio guards and conformal calibration.
+keywords:
+  - algorithmic trading
+  - false discovery rate
+  - market impact
+  - backtest overfitting
+  - conformal prediction
+  - walk-forward validation
+license: MIT

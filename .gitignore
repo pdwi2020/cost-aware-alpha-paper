@@ -56,3 +56,13 @@ src/._*
 references/._*
 paper/._*
 data/._*
+
+# Manuscript lives in a separate location — this is a code repo
+paper/
+journal_targets.*
+
+# Copyrighted reference PDFs — never publish
+references/pdfs/
+
+# Cached public-data inputs for the R2000 re-instantiation
+data/processed/r2000_inputs/

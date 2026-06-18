@@ -36,15 +36,16 @@ from src.backtest.generate_signals import (
     build_signal_weights,
     generate_composite_signal,
 )
+from src.universe_paths import proc
 
-FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
-SHAP_PATH   = ROOT / "data" / "processed" / "shap_summary.parquet"
-FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+FDR_PATH    = proc(ROOT, "fdr_results.parquet")
+SHAP_PATH   = proc(ROOT, "shap_summary.parquet")
+FEAT_PATH   = proc(ROOT, "features_all.parquet")
+OHLCV_PATH  = proc(ROOT, "daily_ohlcv.parquet")
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
-OUT_PNL     = ROOT / "data" / "processed" / "holdout_pnl.parquet"
-OUT_METRICS = ROOT / "data" / "processed" / "holdout_metrics.parquet"
+OUT_PNL     = proc(ROOT, "holdout_pnl.parquet")
+OUT_METRICS = proc(ROOT, "holdout_metrics.parquet")
 
 HOLDOUT_START = "2022-01-01"
 HOLDOUT_END   = "2024-12-31"
@@ -53,11 +54,36 @@ HOLDOUT_END   = "2024-12-31"
 REBAL_FREQ = 5
 VOL_WINDOW = 21
 
+# ±50% return cap for corporate-action artifact removal.
+# Must match build_features.py and run_baselines.py for full coherence.
+SANITIZE_CAP = 0.50
+
+# Screen 0 — tradeable-universe filter. Names priced below MIN_PRICE on the
+# trade date are excluded: post-delisting / penny prints (e.g. failed banks
+# trading at $0.02) are not realistically tradeable and carry the bulk of the
+# residual corporate-action artifacts. Combined with the $1M ADV filter this
+# defines the tradeable universe, applied uniformly across all strategies.
+MIN_PRICE = 5.0
+
 
 def log(msg): print(msg, flush=True)
 
 
+def apply_min_price_filter(positions, close_w, min_price=MIN_PRICE):
+    """Screen 0: zero positions in names priced < min_price on the trade date,
+    then renormalise gross (L1) leverage to 1 per day so capital stays deployed."""
+    pxa = close_w.reindex(index=positions.index, columns=positions.columns).ffill()
+    positions = positions.where(pxa >= min_price, 0.0)
+    l1 = positions.abs().sum(axis=1).replace(0, np.nan)
+    return positions.div(l1, axis=0).fillna(0.0)
+
+
 def build_returns_vol_adv_holdout(ohlcv, tickers, start, end):
+    """Build holdout returns, vol, ADV with ±50% return sanitization.
+
+    Returns are clipped to ±SANITIZE_CAP to remove corporate-action artifacts
+    before any P&L simulation.  ADV uses raw close × volume (scale preserved).
+    """
     mask = (
         ohlcv["ticker"].isin(tickers)
         & (ohlcv["date"] >= pd.Timestamp(start))
@@ -66,12 +92,17 @@ def build_returns_vol_adv_holdout(ohlcv, tickers, start, end):
     sub  = ohlcv[mask][["ticker", "date", "close", "volume"]].copy()
     close_w  = sub.pivot(index="date", columns="ticker", values="close")
     volume_w = sub.pivot(index="date", columns="ticker", values="volume")
-    returns      = close_w.pct_change()
+    returns_raw  = close_w.pct_change(fill_method=None)
+    # Sanitize: clip to ±50% before vol/ADV computation
+    n_clipped = int((returns_raw.abs() > SANITIZE_CAP).sum().sum())
+    if n_clipped > 0:
+        log(f"  [sanitize] Clipped {n_clipped} (ticker,day) cells with |ret|>{SANITIZE_CAP:.0%}")
+    returns      = returns_raw.clip(lower=-SANITIZE_CAP, upper=SANITIZE_CAP)
     vol          = returns.rolling(VOL_WINDOW, min_periods=10).std()
-    dollar_vol   = close_w * volume_w
+    dollar_vol   = close_w * volume_w   # raw close × volume for ADV scale
     adv_dollars  = dollar_vol.rolling(VOL_WINDOW, min_periods=10).mean()
     ret_mask = (returns.index >= pd.Timestamp(start)) & (returns.index <= pd.Timestamp(end))
-    return returns[ret_mask], vol[ret_mask], adv_dollars[ret_mask]
+    return returns[ret_mask], vol[ret_mask], adv_dollars[ret_mask], close_w[ret_mask]
 
 
 def main():
@@ -114,7 +145,7 @@ def main():
         log(f"  Date range: {sig.index.min().date()} → {sig.index.max().date()}")
 
         tickers = sig.columns.tolist()
-        returns, vol, adv_dollars = build_returns_vol_adv_holdout(
+        returns, vol, adv_dollars, close_px = build_returns_vol_adv_holdout(
             ohlcv, tickers, HOLDOUT_START, HOLDOUT_END
         )
 
@@ -124,6 +155,11 @@ def main():
             impact_coeff=cfg["impact_coeff"],
         )
         positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
+        # Screen 0: restrict to tradeable universe (price ≥ $5)
+        n_before = int((positions.abs() > 1e-12).sum().sum())
+        positions = apply_min_price_filter(positions, close_px, MIN_PRICE)
+        n_after = int((positions.abs() > 1e-12).sum().sum())
+        log(f"  Screen 0 (price≥${MIN_PRICE:.0f}): {n_before}→{n_after} active positions")
         min_adv   = cfg.get("min_adv_dollars", 1e6)
         pnl_df    = sim.simulate_pnl(
             positions, returns, vol=vol,
@@ -156,7 +192,7 @@ def main():
 
     # Load IS results from sensitivity_3d (weekly, base costs)
     try:
-        sens = pd.read_parquet(ROOT / "data" / "processed" / "sensitivity_3d.parquet")
+        sens = pd.read_parquet(proc(ROOT, "sensitivity_3d.parquet"))
         is_base = sens[(sens.spread_bps == 3) & (sens.impact_coeff == 0.10) & (sens.rebal_freq == 5)]
         log(f"\n  IS (2013-2021):")
         for _, row in is_base.iterrows():
