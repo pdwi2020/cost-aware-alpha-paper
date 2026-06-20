@@ -66,3 +66,6 @@ references/pdfs/
 
 # Cached public-data inputs for the R2000 re-instantiation
 data/processed/r2000_inputs/
+
+# generated pipeline outputs (regenerated from spec; not source)
+results/
