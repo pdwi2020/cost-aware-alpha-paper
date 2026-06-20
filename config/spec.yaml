@@ -1,0 +1,181 @@
+# =====================================================================
+# CAVAL pre-registration spec — SINGLE SOURCE OF TRUTH
+# =====================================================================
+# This file is frozen and committed BEFORE any new result is generated.
+# Its git blob hash gates the locked out-of-sample (OOS) unlock: the 2025+
+# confirmatory evaluation may be touched exactly ONCE, only after this spec
+# is committed. Every number in the paper/README must be regenerated from
+# results/manifest/ (see reproducibility:) — no hand-entered numbers.
+#
+# Honesty invariant: maximal effort != a target Sharpe. The locked OOS is
+# reported as-is whatever the sign. The deliverable is a coherent,
+# reproducible, rigorously-validated protocol plus candid evidence.
+# Supersedes the drifting per-config values noted inline below.
+meta:
+  spec_version: "2.0-rebuild"
+  created: "2026-06-20"
+  provenance: "git HEAD authoritative; local==HEAD (clean); X9 mirror was stale (R2000 import)."
+  venue: "Expert Systems with Applications (ESWA), Elsevier — double-anonymized"
+
+# ---------------------------------------------------------------------
+data:
+  catalog: "${X9_MOUNT}/data/catalog.duckdb"   # equities_ohlcv_1m, ff_*_daily, fred_macro
+  equities_table: "equities_ohlcv_1m"
+  confirmed_2025_plus: true                      # verified: a 2025-01-02 row exists
+  sp500_snapshots_dir: "datasets/sp500_holdings" # annual CSVs 2000.csv .. 2025.csv (PIT membership)
+
+# ---------------------------------------------------------------------
+universes:
+  primary:
+    name: "pit_sp500_annual"
+    builder: "src.data.universe_builder.build_sp500_universe"   # WIRE THIS (was unused)
+    granularity: "annual"          # membership applied at year level
+    limitation: "intra-year additions/removals are not timed; stated as a limitation"
+  robustness:
+    name: "liquidity_topN"
+    builder: "src.data.build_liquidity_universe (NEW)"
+    rule: "top-N names by trailing ADV each day; N=500; fully reconstructible, no membership data"
+  delta_only:
+    name: "survivorship_union"     # the OLD broken universe — used ONLY to quantify bias
+    builder: "src.data.universe_builder.get_universe_tickers"
+    use: "report survivorship-bias delta vs primary; NEVER used for inference"
+
+# ---------------------------------------------------------------------
+splits:
+  train_end:          "2021-12-31"
+  exploratory_start:  "2022-01-01"   # 2022-2024 DEMOTED to exploratory/validation (no longer 'single-touch')
+  exploratory_end:    "2024-12-31"
+  locked_oos_start:   "2025-01-01"   # SINGLE-TOUCH confirmatory holdout (data confirmed present)
+  locked_oos_end:     "DATA_MAX"     # resolved at run time to max available trading date
+  forward_track:      "post_submission"  # frozen-hash prospective evaluation, reported at revision
+  walkforward_warmup_years: 3
+  walkforward_step_years:   1
+
+# ---------------------------------------------------------------------
+# Screen 0 — LOCKED, UPSTREAM, LAGGED (fixes look-ahead). Applied first in
+# build_features, decided from t-1 information only.
+screen0:
+  applied_at: "feature_build"        # NOT at P&L time (remove duplicate in run_holdout.py)
+  decision_lag_days: 1               # tradeability of position earning return_t uses <= t-1 data
+  return_winsor_abs: 0.50            # +/-50% daily-return winsorization (corporate-action artifacts)
+  min_price_usd: 5.0                 # priced >= $5 on t-1
+  min_adv_usd: 1000000               # $1M ADV on trailing window  (UNIFIES drift: backtest.yaml $1M wins; fdr.yaml $5M SUPERSEDED)
+  drop_market_cap_filter: true       # fdr.yaml min_market_cap_bn was never implemented; removed
+
+# ---------------------------------------------------------------------
+features:
+  tracks:
+    A: "FF5+UMD-residual 5-day idiosyncratic forward return"
+    B: "raw 5-day forward return"
+  forward_horizon_days: 5
+  factor_window_days: 252
+  # Pre-registered KEPT features (genuinely cross-sectional — survive daily demeaning):
+  kept:
+    - amihud            # illiquidity
+    - mom_12_1          # 12-1 momentum
+    - ret_1d
+    - ret_5d
+    - ret_21d
+    - ret_63d
+    - ret_252d
+    - sharpe_21d
+    - vol_21d           # idiosyncratic vol
+    - roll_spread       # FIX formula -> Roll 2*sqrt(-cov) of price-change autocovariance
+    - corr_sector_etfs  # stock-specific sector-ETF correlations (corr_XLK, ... ; stock-varying)
+    - overnight_gap
+    - vol_am
+    - vol_pm
+    - vol_clock
+    - vol_sig_ratio
+    - vwap_dev
+  # DROPPED — exact sign-duplicates (double-counted hypotheses):
+  dropped_duplicates:
+    - reversal_1w        # == -ret_5d
+    - reversal_4w        # == -ret_21d
+  # DROPPED — pure broadcast (constant across tickers each day -> cancel under demeaning, cannot be alpha):
+  dropped_broadcast:
+    - vix
+    - vix_chg_5d
+    - term_spread
+    - term_spread_chg_21d
+    - credit_proxy
+    - credit_proxy_chg_5d
+    - dxy_ret_5d
+    - wti_ret_21d
+  # ADDED — prespecified stock-level macro interactions (re-inject macro via cross-sectional dispersion):
+  added_interactions:
+    - beta_x_vix             # rolling market beta * VIX level
+    - beta_x_term_spread     # rolling beta * term-spread change
+    - credit_beta_x_credit   # stock credit-sensitivity * credit-proxy change
+  # broadcast macro variables are RETAINED only as regime labels (calm/stressed), never as signals.
+  regime_labels: [vix_calm_threshold]
+  remove_shap_preselection: true     # delete run_fdr.py SHAP_DROPPED; test the full pre-registered set
+
+# ---------------------------------------------------------------------
+fdr:
+  estimand: "daily_cross_sectional_spearman_ic"   # per-day IC across stocks (matches market-neutral book)
+  aggregation: "mean_over_days"
+  test_statistic: "t_stat_on_daily_ic_series"
+  q: 0.10
+  methods: ["BH", "BHY"]
+  dependence_robust:
+    bootstrap: "stationary_block"   # Politis-Romano; CIs + p-values on the daily-IC series
+    block_length_days: 21
+    n_samples: 1000
+  pooled_ic: false                   # the old pooled-fold IC is REMOVED (was run_fdr.py:84)
+
+# ---------------------------------------------------------------------
+portfolio:
+  gross_exposure_target: 1.0
+  max_gross: 2.0
+  max_single_position: 0.05          # HARD cap — enforced by water-fill, NOT clip-then-reinflate
+  cap_algorithm: "iterative_waterfill"
+  aum_dollars: 100000000             # $100M reference for impact scaling
+  implementation_lag_days: 1
+  rebalancing_frequency_days: 5      # weekly primary; [1,5,21] for sensitivity
+  signal: "SHAP-weighted sign-of-mean-IC over BH-selected features (l1-normalised)"
+
+costs:
+  model: "sqrt_participation_inspired"   # NOT 'Almgren-Chriss square-root' (AC2001 is linear); reframe + cite later work
+  spread_bps: 3
+  impact_coeff: 0.10                 # total impact ~ X^{3/2} (drop the wrong 625x claim)
+  borrow_bps: {easy: 0, medium: 150, hard: 300}
+
+# ---------------------------------------------------------------------
+ta_fdr:
+  rebuild: true                      # do NOT cut; make it a valid screen
+  null: "stationary_block_bootstrap_JOINT"   # one panel-wide resample per draw, shared across features
+  block_length_days: 21
+  preserves: ["ticker_autocorrelation", "cross_sectional_dependence"]
+  statistic: "mean_net_return"       # net <= gross holds POINTWISE (Sharpe does NOT -> old Prop 1 invalid)
+  n_samples: 1000
+  online_fdr: "SAFFRON_or_LORD++_with_guarantee | else BH/BHY on bootstrap p-values"  # replace custom alpha-investing reward
+
+validation:
+  pbo_cscv: {splits: 16, target: 0.30, evaluated_on: "deployed_SHAP_strategy_selection_path"}  # NOT just model ICs
+  dsr: {trial_count: "ACTUAL_number_of_configs_searched"}   # correct the count
+  conformal: {alpha: 0.10, method: "split", calibration_fraction: 0.20, role: "diagnostic_only"}
+  knockoffs: {gaussian: true, cost_aware: true, on_failure: "report_as_supplementary_negative_result"}
+
+robustness_battery:
+  universes: ["pit_sp500_annual", "liquidity_topN"]
+  tracks: ["A", "B"]
+  runs: [ablation, sensitivity, oos_subperiods, oos_attribution, oos_cost_sweep,
+         excl_megacap, regime_signal, baselines, r2000_cross_universe]
+  baselines: [buy_and_hold, equal_weight_momentum, gross_only_no_cost]
+
+formal:
+  location: "supplementary"
+  lean_keep: [cost_nonneg, net_le_gross, impactAvg_mono, arv_antitone, bhy_subset_bh, split_conformal_coverage]
+  proposition_1: "RESTATE on statistic=mean_net_return (valid); DELETE the Sharpe-domination claim"
+  invariant: "no 'cost => Sharpe domination' claim anywhere; lake build zero sorry"
+
+# ---------------------------------------------------------------------
+reproducibility:
+  orchestrator: "run_all.sh (NEW — none exists today)"
+  manifest_dir: "results/manifest/"
+  regenerator: "emits every paper/README number from manifest (zero hand-entered)"
+  coherence_check: "asserts every PDF number == its manifest source"
+  anonymity_check: "scans manuscript for identifying tokens (names/emails/phone/ORCID/repo)"
+  repo: "pdwi2020/cost-aware-alpha-paper (PRIVATE)"
+  public_release: "GATED on explicit user authorization (public push + Zenodo DOI)"
