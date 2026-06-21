@@ -23,21 +23,7 @@ import lightgbm as lgb
 
 warnings.filterwarnings("ignore")   # suppress all — warnings go to log and obscure progress
 
-# ---------------------------------------------------------------------------
-# Feature groups
-# ---------------------------------------------------------------------------
-XS_FEATURES = [
-    "ret_1d", "ret_5d", "ret_21d", "ret_63d", "ret_252d", "mom_12_1",
-    "reversal_1w", "reversal_4w", "vol_21d", "sharpe_21d", "amihud",
-    "roll_spread", "overnight_gap", "vwap_dev", "vol_clock", "vol_sig_ratio",
-    "corr_SPY", "corr_QQQ", "corr_XLK", "corr_XLE", "corr_XLF", "corr_XLY",
-    "corr_XLP", "corr_XLI", "corr_XLB", "corr_XLU", "corr_XLV", "corr_XLC",
-    "corr_XLRE", "term_spread_x_mom",
-]
-MACRO_FEATURES = [
-    "vix", "vix_chg_5d", "term_spread", "term_spread_chg_21d",
-    "dxy_ret_5d", "wti_ret_21d", "credit_proxy", "credit_proxy_chg_5d",
-]
+from src.features.feature_spec import feature_columns as _feature_columns
 
 
 # ---------------------------------------------------------------------------
@@ -78,31 +64,26 @@ def preprocess(
 ) -> tuple:
     """Preprocess features for one fold.
 
-    Returns (X_tr_np, X_te_np): float32 arrays, NaN → 0.
+    All 32 pre-registered features are cross-sectional (stock-level signals
+    that survive daily demeaning). The broadcast macro columns have been
+    dropped from the feature set; their information re-enters via the
+    stock-specific beta interaction terms (beta_x_vix, beta_x_term_spread,
+    credit_beta_x_credit) which ARE stock-varying and receive XS treatment.
+
+    Returns (X_tr_np, X_te_np, feat_cols): float32 arrays, NaN → 0.
     """
-    # Determine which columns are actually present
-    xs_cols    = [c for c in XS_FEATURES    if c in X_train.columns]
-    macro_cols = [c for c in MACRO_FEATURES if c in X_train.columns]
-    all_cols   = xs_cols + macro_cols
+    # Derive the canonical feature set from the training frame columns.
+    all_cols = _feature_columns(X_train)
 
     X_tr = X_train[all_cols].values.astype(np.float64)
     X_te = X_test[all_cols].values.astype(np.float64)
 
-    n_xs = len(xs_cols)
-
     dates_tr = X_train.index.get_level_values("date").values
     dates_te = X_test.index.get_level_values("date").values
 
-    # XS block: cross-sectional winsorize + z-score
-    if n_xs > 0:
-        X_tr[:, :n_xs] = _xs_winsorize_zscore(X_tr[:, :n_xs], dates_tr, q)
-        X_te[:, :n_xs] = _xs_winsorize_zscore(X_te[:, :n_xs], dates_te, q)
-
-    # Macro block: time-series z-score (fit on train)
-    if macro_cols:
-        X_tr[:, n_xs:], X_te[:, n_xs:] = _ts_zscore(
-            X_tr[:, n_xs:], X_te[:, n_xs:]
-        )
+    # All retained features are cross-sectional: winsorize + z-score per date.
+    X_tr = _xs_winsorize_zscore(X_tr, dates_tr, q)
+    X_te = _xs_winsorize_zscore(X_te, dates_te, q)
 
     np.nan_to_num(X_tr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     np.nan_to_num(X_te, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
@@ -234,7 +215,12 @@ class ModelSuite:
         targets: pd.Series,
         fold_dates: list,
     ) -> pd.DataFrame:
-        """Walk-forward loop. Returns DataFrame: index=fold_id, columns=model names."""
+        """Walk-forward loop. Returns DataFrame: index=fold_id, columns=model names.
+
+        If `features` contains an `s0_eligible` column, only rows where
+        s0_eligible is truthy are included in training and test sets, matching
+        the cross-sectional estimand (Screen 0 eligible universe only).
+        """
         records = []
         for fd in fold_dates:
             fid = fd["fold_id"]
@@ -246,6 +232,12 @@ class ModelSuite:
                       (dates <= pd.Timestamp(fd["train_end"]))
             te_mask = (dates >= pd.Timestamp(fd["test_start"])) & \
                       (dates <= pd.Timestamp(fd["test_end"]))
+
+            # Restrict to s0_eligible rows if the column is present.
+            if "s0_eligible" in features.columns:
+                elig = features["s0_eligible"].astype(bool)
+                tr_mask = tr_mask & elig
+                te_mask = te_mask & elig
 
             X_tr = features[tr_mask]
             y_tr = targets[tr_mask]
@@ -442,8 +434,8 @@ def make_fold_dates(
 
 def _dummy_preprocess(X: pd.DataFrame, feature_cols: list):
     """Light preprocessing for inference-only (no val split)."""
-    xs_cols    = [c for c in XS_FEATURES    if c in X.columns and c in feature_cols]
-    macro_cols = [c for c in MACRO_FEATURES if c in X.columns and c in feature_cols]
-    all_cols   = xs_cols + macro_cols
+    # Restrict to the pre-registered columns that are both available in X
+    # and were recorded during training (feature_cols).
+    all_cols = [c for c in feature_cols if c in X.columns]
     arr = X[all_cols].fillna(0).values.astype(np.float32)
     return arr, arr, all_cols

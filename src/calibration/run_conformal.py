@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.models.model_suite import make_fold_dates
 from src.calibration.conformal import ConformalIntervals
+from src.features.feature_spec import feature_columns as _feature_columns
 
 FEAT_PATH    = ROOT / "data" / "processed" / "features_all.parquet"
 OUT_COV      = ROOT / "data" / "processed" / "conformal_coverage.parquet"
@@ -45,15 +46,13 @@ CAL_FRACTION = 0.20       # 20% of training period for calibration
 RIDGE_ALPHA  = 1.0        # Ridge regularisation (λ)
 VIX_THRESH   = 20.0       # calm/stressed split
 
-SHAP_DROPPED = {"corr_XLRE", "corr_XLC", "term_spread_x_mom"}
-
 
 def log(msg): print(msg, flush=True)
 
 
 def get_feature_cols(df: pd.DataFrame, target_col: str) -> list:
-    exclude = {"target_track_a", "target_track_b"} | SHAP_DROPPED
-    return [c for c in df.columns if c not in exclude and c != target_col]
+    # Use the canonical pre-registered feature set from feature_spec.
+    return _feature_columns(df)
 
 
 def xs_preprocess(X: pd.DataFrame) -> pd.DataFrame:
@@ -85,7 +84,7 @@ def run_fold(
     fold: dict,
     target_col: str,
     feature_cols: list,
-    vix_col: str = "vix",
+    vix_col: str = "regime_vix",
 ) -> dict:
     """Fit, calibrate, and evaluate conformal intervals for one fold."""
     dates = df.index.get_level_values("date")
@@ -113,7 +112,7 @@ def run_fold(
     y_tr = np.clip(y_tr, q_lo_tr, q_hi_tr)
     y_te = np.clip(y_te, q_lo_tr, q_hi_tr)   # same bounds to avoid lookahead
 
-    vix_te = df.loc[te_valid, vix_col].values if vix_col in df.columns else None
+    regime_te = df.loc[te_valid, vix_col].values if vix_col in df.columns else None
 
     if len(X_tr) < 100 or len(X_te) < 10:
         return {}
@@ -147,21 +146,22 @@ def run_fold(
     # Overall coverage
     cov_overall = ci.empirical_coverage(te_preds, y_te)
 
-    # Regime coverage
+    # Regime coverage — regime_vix is a string label ("calm"/"stressed").
+    # Treat any non-"calm" value as stressed.
     cov_calm     = np.nan
     cov_stressed = np.nan
     q_calm       = np.nan
     q_stressed   = np.nan
 
-    if vix_te is not None:
-        calm_m     = vix_te <= VIX_THRESH
+    if regime_te is not None:
+        calm_m     = np.array([str(v).lower() == "calm" for v in regime_te])
         stressed_m = ~calm_m
 
         # Regime-specific q_hat (calibrate on regime subsets of calibration data)
-        vix_cal = df.loc[tr_valid, vix_col].values[-n_cal:] \
+        regime_cal = df.loc[tr_valid, vix_col].values[-n_cal:] \
                   if vix_col in df.columns else None
-        if vix_cal is not None:
-            calm_cal     = vix_cal <= VIX_THRESH
+        if regime_cal is not None:
+            calm_cal     = np.array([str(v).lower() == "calm" for v in regime_cal])
             stressed_cal = ~calm_cal
 
             for regime_m_cal, regime_m_te, attr in [
@@ -183,6 +183,7 @@ def run_fold(
         if stressed_m.sum() > 0:
             cov_stressed = cov_stressed if not np.isnan(cov_stressed) else \
                 ci.empirical_coverage(te_preds[stressed_m], y_te[stressed_m])
+        # vix_te alias removed — regime handled via regime_vix string labels above
 
     return {
         "fold":           fold["fold_id"],

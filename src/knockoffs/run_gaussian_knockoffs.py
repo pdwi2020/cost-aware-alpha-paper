@@ -34,13 +34,13 @@ from src.backtest.run_ta_fdr import (
     build_single_feature_signal, _fast_net_sharpe,
     load_ohlcv_matrices, estimate_ic_signs,
 )
-from src.fdr.run_fdr import get_surviving_features
 from src.backtest.portfolio import PortfolioSimulator
 from src.knockoffs.run_cost_aware_knockoffs import (
     compute_cost_aware_importance, knockoff_plus_filter,
-    FEATURES_PATH, OHLCV_PATH, FDR_PATH, SHAP_PATH, CFG_PATH,
+    FEATURES_PATH, OHLCV_PATH, FDR_PATH, CFG_PATH,
     IS_START, IS_END, FDR_Q, N_NULL_FEATS,
 )
+from src.features.feature_spec import feature_columns as _feature_columns
 
 OUT_IMPORTANCE = ROOT / "data" / "processed" / "cak_gaussian_importance.parquet"
 OUT_RESULTS    = ROOT / "data" / "processed" / "cak_gaussian_results.parquet"
@@ -150,9 +150,10 @@ def main():
 
     with open(CFG_PATH) as f:
         cfg = yaml.safe_load(f)
-    features = get_surviving_features(SHAP_PATH)
-    log(f"  Features: {len(features)}")
     feat_df = pd.read_parquet(FEATURES_PATH)
+    # Derive the canonical pre-registered feature set from the loaded frame.
+    features = _feature_columns(feat_df)
+    log(f"  Features: {len(features)}")
     ohlcv   = pd.read_parquet(OHLCV_PATH)
     sim = PortfolioSimulator(config_path=str(CFG_PATH))
     target_col = "target_track_b" if args.track == "track_b" else "target_track_a"

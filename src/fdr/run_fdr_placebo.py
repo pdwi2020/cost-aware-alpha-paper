@@ -31,11 +31,10 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.fdr.bh_correction import compute_ic_tstats, benjamini_hochberg
-from src.fdr.run_fdr import get_surviving_features
 from src.models.model_suite import make_fold_dates
+from src.features.feature_spec import feature_columns as _feature_columns
 
 FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
-SHAP_PATH     = ROOT / "data" / "processed" / "shap_summary.parquet"
 OUT_PLACEBO   = ROOT / "data" / "processed" / "fdr_placebo.parquet"
 
 FDR_Q        = 0.10
@@ -114,18 +113,20 @@ def main():
     log(f"=== Placebo FDR (N={N_PLACEBO} Gaussian noise features, seed={PLACEBO_SEED}) ===\n")
     t0 = time.time()
 
-    real_features = get_surviving_features(SHAP_PATH)
+    log("Loading features_all.parquet …")
+    df = pd.read_parquet(FEATURES_PATH)
+    df.index = df.index.set_levels(
+        [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
+    )
+
+    # Derive the canonical pre-registered feature set from the loaded frame.
+    real_features = _feature_columns(df)
     fold_dates    = make_fold_dates()
 
     log(f"  Real features: {len(real_features)}")
     log(f"  Placebo features: {N_PLACEBO}  (prefix {PLACEBO_PREFIX!r})")
     log(f"  Total hypotheses: {len(real_features) + N_PLACEBO}")
     log(f"  BH q={FDR_Q} → expected placebo rejections ≤ {FDR_Q * N_PLACEBO:.1f}")
-    log("\nLoading features_all.parquet …")
-    df = pd.read_parquet(FEATURES_PATH)
-    df.index = df.index.set_levels(
-        [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
-    )
 
     log("Injecting placebo features …")
     df_aug, placebo_names = inject_placebo_features(df)

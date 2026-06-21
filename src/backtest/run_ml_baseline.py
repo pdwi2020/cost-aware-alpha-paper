@@ -46,11 +46,10 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.models.model_suite import (
-    XS_FEATURES,
-    MACRO_FEATURES,
     make_fold_dates,
     preprocess,
 )
+from src.features.feature_spec import feature_columns as _feature_columns
 from src.backtest.portfolio import PortfolioSimulator
 from src.backtest.run_holdout import (
     apply_min_price_filter,
@@ -229,8 +228,6 @@ def fit_oos_model(X_all_raw, y_all_raw, mcfg):
     Returns the fitted models plus IS macro stats (mu, sig) so OOS data
     can be standardised with the same parameters — no look-ahead into OOS.
     """
-    from src.models.model_suite import XS_FEATURES, MACRO_FEATURES
-
     tr_mask = y_all_raw.notna()
     X_c = X_all_raw[tr_mask]
     y_c = y_all_raw[tr_mask].values.astype(np.float32)
@@ -251,41 +248,26 @@ def fit_oos_model(X_all_raw, y_all_raw, mcfg):
     rf_model  = _best_rf( X_tr_np, y_tr, X_vl_np, y_vl, X_full_np, y_c, mcfg)
     xgb_model = _best_xgb(X_tr_np, y_tr, X_vl_np, y_vl, X_full_np, y_c, mcfg)
 
-    # Extract IS macro stats (to standardise OOS macro features consistently)
-    macro_cols = [c for c in MACRO_FEATURES if c in X_c.columns]
-    xs_cols    = [c for c in XS_FEATURES    if c in X_c.columns]
-    all_cols   = xs_cols + macro_cols
-    n_xs = len(xs_cols)
-    macro_arr = X_c[all_cols].values.astype(np.float64)[:, n_xs:]
-    is_macro_mu  = np.nanmean(macro_arr, axis=0)
-    is_macro_sig = np.nanstd( macro_arr, axis=0)
-    is_macro_sig[is_macro_sig < 1e-8] = 1.0
-
-    return rf_model, xgb_model, (is_macro_mu, is_macro_sig, xs_cols, macro_cols)
+    # Record the canonical feature columns for OOS alignment.
+    all_cols = _feature_columns(X_c)
+    return rf_model, xgb_model, all_cols
 
 
 def predict_oos(rf_model, xgb_model, X_te_raw, is_stats):
-    """Predict OOS using frozen models with IS macro stats (no OOS look-ahead).
+    """Predict OOS using frozen models, aligned to IS feature columns.
 
-    XS features: cross-sectional winsorize+zscore per date (same as always).
-    Macro features: standardised with IS training mean/std — no OOS look-ahead.
+    All pre-registered features are cross-sectional; broadcast macro columns
+    are excluded by feature_spec.feature_columns().  OOS preprocessing uses
+    XS winsorize+zscore per date (same as training), with no IS-stats look-ahead.
     """
     from src.models.model_suite import _xs_winsorize_zscore
 
-    is_macro_mu, is_macro_sig, xs_cols, macro_cols = is_stats
-    all_cols = xs_cols + macro_cols
-    n_xs = len(xs_cols)
-
-    arr = X_te_raw[all_cols].values.astype(np.float64)
+    all_cols = is_stats  # list of feature column names from fit_oos_model
+    arr = X_te_raw[[c for c in all_cols if c in X_te_raw.columns]].values.astype(np.float64)
     dates_te = X_te_raw.index.get_level_values("date").values
 
-    # XS block: cross-sectional winsorize + z-score per date
-    if n_xs > 0:
-        arr[:, :n_xs] = _xs_winsorize_zscore(arr[:, :n_xs], dates_te)
-
-    # Macro block: standardise using IS stats (fit on IS, apply to OOS)
-    if macro_cols:
-        arr[:, n_xs:] = (arr[:, n_xs:] - is_macro_mu) / is_macro_sig
+    # All features are cross-sectional: winsorize + z-score per date.
+    arr = _xs_winsorize_zscore(arr, dates_te)
 
     np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     X_np = arr.astype(np.float32)
@@ -367,7 +349,7 @@ def main():
     log(f"  OOS window : {OOS_START} → {OOS_END}")
     log(f"  Target     : track_b (h=5d forward return)")
     log(f"  Ensemble   : 50/50 RF + XGB (standardised predictions)")
-    log(f"  Features   : all {len(XS_FEATURES)+len(MACRO_FEATURES)} (XS={len(XS_FEATURES)}, Macro={len(MACRO_FEATURES)})")
+    log(f"  Features   : all pre-registered (derived per-frame via feature_spec.feature_columns)")
     log(f"  Rebal freq : {REBAL_FREQ}d (weekly)")
     log(f"  Costs      : spread=3bps, impact=0.10, AUM=$100M\n")
     t_total = time.time()

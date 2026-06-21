@@ -3,14 +3,14 @@
 Addresses referee point M5: the IS→OOS sign-flip mechanism (§9.4) is narrative.
 This script produces a quantified per-group P&L decomposition.
 
-Feature groups (25 BH-selected Track B features):
-  Macro / cross-asset  (2): vix, credit_proxy_chg_5d
-  Sector-crowding     (10): corr_XLF, corr_XLB, corr_XLK, corr_XLI, corr_SPY,
-                            corr_QQQ, corr_XLY, corr_XLV, corr_XLE, corr_XLP
-  Liquidity / vol      (6): amihud, roll_spread, vol_21d, sharpe_21d,
-                            vol_sig_ratio, vol_clock
-  Reversal / momentum  (7): ret_1d, ret_5d, reversal_1w, ret_21d,
-                            reversal_4w, ret_63d, vwap_dev
+Feature groups (BH-selected Track B features, grouped by economic theme):
+  Momentum            : mom_12_1, ret_1d, ret_5d, ret_21d, ret_63d, ret_252d
+  Sector-crowding     : corr_SPY, corr_QQQ, corr_XLK, corr_XLE, corr_XLF, ...
+  Liquidity / vol     : amihud, roll_spread, vol_21d, sharpe_21d, vol_sig_ratio,
+                        vol_clock, vwap_dev, overnight_gap
+  Macro-interaction   : beta_x_vix, beta_x_term_spread, credit_beta_x_credit
+  (reversal_1w/4w dropped: == -ret_5d/-ret_21d; vix/credit_proxy_chg_5d dropped:
+   broadcast-only; beta interactions carry macro signal stock-specifically)
 
 Two modes (both reported):
   (A) Standalone — each group's sub-signal run through the full pipeline.
@@ -47,6 +47,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.backtest.portfolio import PortfolioSimulator
+from src.features.feature_spec import feature_columns as _feature_columns
 
 # ── paths ────────────────────────────────────────────────────────────────────
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
@@ -67,24 +68,27 @@ ANN        = 252.0
 MIN_PRICE    = 5.0
 SANITIZE_CAP = 0.50
 
-# ── feature group map (25 BH-selected Track B features) ─────────────────────
-GROUP_MAP = {
-    "Macro":    ["vix", "credit_proxy_chg_5d"],
-    "Sector":   ["corr_XLF", "corr_XLB", "corr_XLK", "corr_XLI", "corr_SPY",
-                 "corr_QQQ", "corr_XLY", "corr_XLV", "corr_XLE", "corr_XLP"],
-    "Liq/Vol":  ["amihud", "roll_spread", "vol_21d", "sharpe_21d",
-                 "vol_sig_ratio", "vol_clock"],
-    "Rev/Mom":  ["ret_1d", "ret_5d", "reversal_1w", "ret_21d",
-                 "reversal_4w", "ret_63d", "vwap_dev"],
-    "Full":     None,   # filled after loading FDR results
+# ── feature group templates (pattern-based; matched against actual BH features) ──
+# reversal_1w / reversal_4w are DROPPED (== -ret_5d / -ret_21d); group absent.
+# vix / credit_proxy_chg_5d are DROPPED broadcast; macro-group now uses interactions.
+# The actual BH-selected feature list comes from fdr_results.parquet at runtime.
+_GROUP_TEMPLATES = {
+    "Momentum":     ["mom_12_1", "ret_1d", "ret_5d", "ret_21d", "ret_63d", "ret_252d"],
+    "Sector":       ["corr_SPY", "corr_QQQ",
+                     "corr_XLK", "corr_XLE", "corr_XLF", "corr_XLY", "corr_XLP",
+                     "corr_XLI", "corr_XLB", "corr_XLU", "corr_XLV", "corr_XLC", "corr_XLRE"],
+    "Liq/Vol":      ["amihud", "roll_spread", "vol_21d", "sharpe_21d",
+                     "vol_sig_ratio", "vol_clock", "vwap_dev", "overnight_gap"],
+    "MacroInteract":["beta_x_vix", "beta_x_term_spread", "credit_beta_x_credit"],
+    "Full":         None,   # filled after loading FDR results
 }
 
-GROUP_LONG = {
-    "Macro":   "Macro / cross-asset",
-    "Sector":  "Sector-crowding",
-    "Liq/Vol": "Liquidity / volatility",
-    "Rev/Mom": "Reversal / momentum",
-    "Full":    "Full Track B (25)",
+_GROUP_LONG_TEMPLATES = {
+    "Momentum":      "Momentum / return",
+    "Sector":        "Sector-crowding",
+    "Liq/Vol":       "Liquidity / volatility",
+    "MacroInteract": "Macro-interaction (beta × macro)",
+    "Full":          "Full Track B (BH-selected)",
 }
 
 
@@ -152,7 +156,7 @@ def run_variant(label: str, mode: str, feat_subset: list, oos_feat: pd.DataFrame
     )
     m = sim.compute_metrics(pnl)
     return {
-        "group":          GROUP_LONG.get(label, label),
+        "group":          _GROUP_LONG_TEMPLATES.get(label, label),
         "mode":           mode,
         "n_features":     len(available),
         "gross_sr":       round(m.get("gross_pnl_sharpe", np.nan), 3),
@@ -188,19 +192,41 @@ def main():
 
     fdr_b       = fdr_df[fdr_df.track == TRACK]
     bh_features = fdr_b.loc[fdr_b.rejected, "feature"].tolist()
+    bh_set      = set(bh_features)
 
-    # Verify group map covers exactly the 25 BH features
-    all_grouped = [f for g in ["Macro","Sector","Liq/Vol","Rev/Mom"] for f in GROUP_MAP[g]]
-    assert set(all_grouped) == set(bh_features), (
-        f"Group map mismatch: {set(all_grouped).symmetric_difference(set(bh_features))}"
-    )
-    GROUP_MAP["Full"] = bh_features
+    # Build GROUP_MAP by intersecting templates with actual BH-selected features.
+    # Dropped columns (reversal_1w, reversal_4w, vix, credit_proxy_chg_5d etc.)
+    # will simply not appear in the intersection.  Empty groups are silently omitted.
+    GROUP_MAP  = {}
+    GROUP_LONG = {}
+    for gname, candidates in _GROUP_TEMPLATES.items():
+        if gname == "Full":
+            GROUP_MAP["Full"]  = bh_features
+            GROUP_LONG["Full"] = _GROUP_LONG_TEMPLATES["Full"]
+            continue
+        members = [f for f in candidates if f in bh_set]
+        if members:
+            GROUP_MAP[gname]  = members
+            GROUP_LONG[gname] = _GROUP_LONG_TEMPLATES.get(gname, gname)
+
+    # Any BH feature not covered by a named group goes into "Other".
+    all_grouped = {f for g, ms in GROUP_MAP.items() if g != "Full" for f in ms}
+    uncovered   = [f for f in bh_features if f not in all_grouped]
+    if uncovered:
+        GROUP_MAP["Other"]  = uncovered
+        GROUP_LONG["Other"] = "Other (unclassified BH features)"
+        log(f"  [attribution] Uncovered BH features → Other group: {uncovered}")
+
+    log(f"  BH-selected features ({len(bh_features)}): {bh_features}")
+    for gname, ms in GROUP_MAP.items():
+        if gname != "Full":
+            log(f"  Group {gname!r} ({len(ms)} features): {ms}")
 
     fdr_sign = {r.feature: float(np.sign(r.mean_ic)) for _, r in fdr_b[fdr_b.rejected].iterrows()}
 
     shap_b   = shap_df[(shap_df.track == TRACK) & (shap_df.model.isin(["xgb", "lgbm"]))]
     shap_agg = shap_b.groupby("feature")["mean_abs_shap"].mean()
-    shap_agg = shap_agg / shap_agg.sum()   # ℓ1-normalise over all 25 BH features
+    shap_agg = shap_agg / shap_agg.sum()   # ℓ1-normalise over all BH features
     shap_weights = {f: float(shap_agg.get(f, 1.0 / len(bh_features))) for f in bh_features}
 
     # OOS OHLCV slice
@@ -234,7 +260,7 @@ def main():
     # ── Mode A: standalone per-group ────────────────────────────────────────
     log("Mode A — Standalone group signals")
     full_net_sr = None
-    for gname in ["Full", "Macro", "Sector", "Liq/Vol", "Rev/Mom"]:
+    for gname in ["Full"] + [g for g in GROUP_MAP if g != "Full"]:
         feats = GROUP_MAP[gname]
         log(f"  {gname} ({len(feats)} features)")
         res = run_variant(gname, "A_standalone", feats, oos_feat,
@@ -249,7 +275,7 @@ def main():
 
     # ── Mode B: leave-one-group-out marginal ────────────────────────────────
     log("\nMode B — Leave-one-group-out marginal contributions")
-    for gname in ["Macro", "Sector", "Liq/Vol", "Rev/Mom"]:
+    for gname in [g for g in GROUP_MAP if g != "Full"]:
         complement = [f for f in bh_features if f not in GROUP_MAP[gname]]
         label_logo = f"{gname}_LOGO"
         log(f"  {gname} complement ({len(complement)} features)")
@@ -270,7 +296,7 @@ def main():
               ].to_string(index=False))
 
     # Acceptance check (anchor: holdout_metrics Track B net SR = +0.357)
-    full_row = out[(out["mode"] == "A_standalone") & (out["group"] == "Full Track B (25)")]
+    full_row = out[(out["mode"] == "A_standalone") & (out["group"] == _GROUP_LONG_TEMPLATES["Full"])]
     if not full_row.empty:
         full_sr = full_row.iloc[0]["net_sr"]
         if abs(full_sr - 0.357) > 0.02:

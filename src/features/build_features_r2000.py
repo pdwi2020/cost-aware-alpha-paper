@@ -50,6 +50,7 @@ from src.features.build_features import (
 )
 from src.features.tier1_classic import build_tier1_features
 from src.features.tier2_extended import CROWDING_ETFS
+from src.features.build_features_all import _compute_rolling_beta
 
 OUT_DIR = ROOT / "data" / "processed"
 INPUT_CACHE = OUT_DIR / "r2000_inputs"
@@ -206,16 +207,27 @@ def build_tier2_crowding_public(daily, start, end, window=20) -> pd.DataFrame:
 # Three intraday features that require the 1-minute catalog (S&P-only).
 INTRADAY_ONLY = ["vwap_dev", "vol_clock", "vol_sig_ratio"]
 
-# Target column order = S&P features_all.parquet order minus INTRADAY_ONLY.
+# Target column order = canonical feature set (no dropped columns) + targets +
+# non-feature columns, minus INTRADAY_ONLY (vwap_dev/vol_clock/vol_sig_ratio).
+# Removed (DROPPED): reversal_1w, reversal_4w (sign-duplicates),
+#   vix, vix_chg_5d, term_spread, term_spread_chg_21d, credit_proxy,
+#   credit_proxy_chg_5d, dxy_ret_5d, wti_ret_21d (broadcast-only macros),
+#   term_spread_x_mom (legacy ad-hoc interaction).
+# Added: beta_x_vix, beta_x_term_spread, credit_beta_x_credit (prespecified).
 COLUMN_ORDER = [
+    # Tier-1 cross-sectional features (kept)
     "ret_1d", "ret_5d", "ret_21d", "ret_63d", "ret_252d", "mom_12_1",
-    "reversal_1w", "reversal_4w", "vol_21d", "sharpe_21d", "amihud",
-    "roll_spread", "vix", "vix_chg_5d", "term_spread", "term_spread_chg_21d",
-    "target_track_b", "target_track_a", "overnight_gap",
+    "vol_21d", "sharpe_21d", "amihud", "roll_spread", "overnight_gap",
+    # Targets
+    "target_track_b", "target_track_a",
+    # Tier-2 crowding proxies (stock-specific, kept)
     "corr_SPY", "corr_QQQ", "corr_XLK", "corr_XLE", "corr_XLF", "corr_XLY",
     "corr_XLP", "corr_XLI", "corr_XLB", "corr_XLU", "corr_XLV", "corr_XLC",
-    "corr_XLRE", "dxy_ret_5d", "wti_ret_21d", "credit_proxy",
-    "credit_proxy_chg_5d", "term_spread_x_mom",
+    "corr_XLRE",
+    # Prespecified macro-interaction features (stock-specific, added)
+    "beta_x_vix", "beta_x_term_spread", "credit_beta_x_credit",
+    # Regime labels (retained for diagnostics, not signals)
+    "regime_vix", "regime_term_spread",
 ]
 
 
@@ -339,9 +351,93 @@ def main() -> pd.DataFrame:
     tier2 = build_tier2_daily(fred, daily, UNIVERSE_START, UNIVERSE_END)
     out = out.join(tier2, how="left")
 
-    # 6. Interaction term (both inputs already lag-1).
-    if "term_spread" in out.columns and "mom_12_1" in out.columns:
-        out["term_spread_x_mom"] = out["term_spread"] * out["mom_12_1"]
+    # 6. Prespecified stock-level macro interaction features.
+    #    These replace the legacy term_spread_x_mom interaction.
+    #    Reuses _compute_rolling_beta from build_features_all.py.
+    #    Formulas mirror build_features_all.py §6 exactly, sourcing macro factors
+    #    from the public FRED panel (loaded above as `fred`).
+    #    All betas are lagged 1 day (shift-1) — no look-ahead.
+    print("\n  Computing prespecified interaction features (beta_x_vix, "
+          "beta_x_term_spread, credit_beta_x_credit)...")
+    BETA_WINDOW = 252
+
+    # Wide daily return panel (sanitized close)
+    close_wide_beta = daily.pivot(index="date", columns="ticker", values="close")
+    close_wide_beta.index = pd.to_datetime(close_wide_beta.index)
+    stock_ret_wide = close_wide_beta.pct_change(fill_method=None)
+
+    # 6a. Market beta — factor = FF5 mkt_rf (from Ken French public data)
+    try:
+        mkt_rf_series = factors["mkt_rf"].reindex(stock_ret_wide.index).ffill()
+        market_beta_lagged_wide = _compute_rolling_beta(
+            stock_ret_wide, mkt_rf_series, window=BETA_WINDOW
+        )
+        mbl_long = (
+            market_beta_lagged_wide.stack(future_stack=True)
+            .rename("_market_beta_lagged")
+            .reset_index()
+        )
+        mbl_long.columns = ["date", "ticker", "_market_beta_lagged"]
+        mbl_long["date"] = pd.to_datetime(mbl_long["date"])
+        out = out.reset_index().merge(mbl_long, on=["ticker", "date"], how="left")
+        out = out.set_index(["ticker", "date"]).sort_index()
+
+        # vix is in `fred` as VIXCLS; use the broadcast value in `out` if present
+        # (it may be there via tier1 broadcast columns), else derive from fred.
+        if "vix" in out.columns:
+            out["beta_x_vix"] = out["_market_beta_lagged"] * out["vix"]
+        else:
+            vix_series = fred["VIXCLS"].rename("vix").reindex(
+                out.index.get_level_values("date")
+            ).values
+            out["beta_x_vix"] = out["_market_beta_lagged"].values * vix_series
+        print("    Added: beta_x_vix = market_beta_lagged × vix")
+
+        # term_spread_chg_21d: 21-day change in T10Y2Y
+        ts_chg_21d = fred["T10Y2Y"].diff(21).rename("term_spread_chg_21d")
+        ts_aligned  = ts_chg_21d.reindex(out.index.get_level_values("date")).values
+        out["beta_x_term_spread"] = out["_market_beta_lagged"].values * ts_aligned
+        print("    Added: beta_x_term_spread = market_beta_lagged × term_spread_chg_21d")
+
+        out.drop(columns=["_market_beta_lagged"], inplace=True)
+    except Exception as _e:
+        print(f"    [warn] Market-beta interactions skipped: {_e}")
+
+    # 6b. Credit beta — factor = daily change in credit_proxy (DGS10 - DFF)
+    try:
+        credit_proxy_raw = (fred["DGS10"] - fred["DFF"]).reindex(
+            stock_ret_wide.index
+        ).ffill()
+        d_credit = credit_proxy_raw.diff(1)
+        credit_beta_lagged_wide = _compute_rolling_beta(
+            stock_ret_wide, d_credit, window=BETA_WINDOW
+        )
+        cbl_long = (
+            credit_beta_lagged_wide.stack(future_stack=True)
+            .rename("_credit_beta_lagged")
+            .reset_index()
+        )
+        cbl_long.columns = ["date", "ticker", "_credit_beta_lagged"]
+        cbl_long["date"] = pd.to_datetime(cbl_long["date"])
+        out = out.reset_index().merge(cbl_long, on=["ticker", "date"], how="left")
+        out = out.set_index(["ticker", "date"]).sort_index()
+
+        # credit_proxy_chg_5d: 5-day change in credit proxy (already in fred-based macro)
+        cp_chg_5d = credit_proxy_raw.diff(5).reindex(
+            out.index.get_level_values("date")
+        ).values
+        out["credit_beta_x_credit"] = out["_credit_beta_lagged"].values * cp_chg_5d
+        out.drop(columns=["_credit_beta_lagged"], inplace=True)
+        print("    Added: credit_beta_x_credit = credit_beta_lagged × credit_proxy_chg_5d")
+    except Exception as _e:
+        print(f"    [warn] Credit-beta interaction skipped: {_e}")
+
+    # 6c. Retain broadcast columns as regime labels; they are NOT features
+    #     (dropped via feature_spec) but kept for diagnostics / regime analysis.
+    if "vix" in out.columns:
+        out["regime_vix"] = out["vix"]
+    if "term_spread" in out.columns:
+        out["regime_term_spread"] = out["term_spread"]
 
     # 6b. Screen-0 artifact winsorization for the remaining ratio features.
     #     On small-caps, (high-low)/close and Amihud illiquidity carry severe
@@ -382,8 +478,11 @@ def main() -> pd.DataFrame:
     dates = out.index.get_level_values("date")
     print(f"\n=== Output ===")
     print(f"Shape:      {out.shape}")
-    print(f"Columns:    {len(out.columns)}  (S&P 40 - 3 intraday = 37 expected)")
+    print(f"Columns:    {len(out.columns)}")
     print(f"Dropped intraday (by design): {INTRADAY_ONLY}")
+    print(f"Dropped broadcast/duplicate (by feature_spec): reversal_1w, reversal_4w, "
+          "vix, vix_chg_5d, term_spread, term_spread_chg_21d, credit_proxy, "
+          "credit_proxy_chg_5d, dxy_ret_5d, wti_ret_21d, term_spread_x_mom")
     print(f"Date range: {dates.min().date()} -> {dates.max().date()}")
     print(f"Tickers:    {out.index.get_level_values('ticker').nunique()}")
     print(f"\nPer-column NaN fraction:")

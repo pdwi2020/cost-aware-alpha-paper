@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.models.model_suite import make_fold_dates
+from src.features.feature_spec import feature_columns as _feature_columns
 
 FEAT_PATH = ROOT / "data" / "processed" / "features_all.parquet"
 OUT_PATH  = ROOT / "data" / "processed" / "aci_coverage.parquet"
@@ -46,15 +47,13 @@ CAL_FRACTION = 0.20
 RIDGE_ALPHA  = 1.0
 GAMMA        = 0.01     # ACI step size (Gibbs-Candès); result is insensitive in [0.005, 0.05]
 
-SHAP_DROPPED = {"corr_XLRE", "corr_XLC", "term_spread_x_mom"}
-
 
 def log(msg): print(msg, flush=True)
 
 
 def get_feature_cols(df, target_col):
-    exclude = {"target_track_a", "target_track_b"} | SHAP_DROPPED
-    return [c for c in df.columns if c not in exclude and c != target_col]
+    # Use the canonical pre-registered feature set from feature_spec.
+    return _feature_columns(df)
 
 
 def fit_fold(df, fold, target_col, feature_cols):

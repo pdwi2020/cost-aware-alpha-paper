@@ -32,10 +32,9 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.fdr.bh_correction import compute_ic_tstats, benjamini_hochberg
-from src.fdr.run_fdr import get_surviving_features
+from src.features.feature_spec import feature_columns as _feature_columns
 
 FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
-SHAP_PATH     = ROOT / "data" / "processed" / "shap_summary.parquet"
 BASELINE_PATH = ROOT / "data" / "processed" / "fdr_results.parquet"
 OUT_EMBARGOED = ROOT / "data" / "processed" / "fdr_embargoed.parquet"
 OUT_COMPARE   = ROOT / "data" / "processed" / "fdr_embargo_comparison.parquet"
@@ -114,20 +113,21 @@ def main():
     log(f"=== FDR with {EMBARGO_DAYS}-BDay Embargo (Robustness Check) ===\n")
     t0 = time.time()
 
-    features   = get_surviving_features(SHAP_PATH)
+    log("Loading features_all.parquet …")
+    df = pd.read_parquet(FEATURES_PATH)
+    df.index = df.index.set_levels(
+        [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
+    )
+
+    # Derive the canonical pre-registered feature set from the loaded frame.
+    features   = _feature_columns(df)
     fold_dates = make_fold_dates_embargoed()
 
     log(f"  Surviving features: {len(features)}")
     log(f"  Folds:")
     for fd in fold_dates:
         log(f"    {fd['fold_id']}: test {fd['test_start']} → {fd['test_end']}  "
-            f"(embargo={fd['embargo_bdays']} BDays, {fd['n_test'] if 'n_test' in fd else '?'} obs)")
-
-    log("\nLoading features_all.parquet …")
-    df = pd.read_parquet(FEATURES_PATH)
-    df.index = df.index.set_levels(
-        [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
-    )
+            f"(embargo={fd['embargo_bdays']} BDays)")
 
     baseline_df = pd.read_parquet(BASELINE_PATH)
 

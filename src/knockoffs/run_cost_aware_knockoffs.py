@@ -88,11 +88,10 @@ from src.backtest.run_ta_fdr import (
     load_ohlcv_matrices, estimate_ic_signs,
 )
 from src.fdr.bh_correction import benjamini_hochberg
-from src.fdr.run_fdr import get_surviving_features
 from src.backtest.portfolio import PortfolioSimulator
+from src.features.feature_spec import feature_columns as _feature_columns
 
 FEATURES_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
-SHAP_PATH      = ROOT / "data" / "processed" / "shap_summary.parquet"
 FDR_PATH       = ROOT / "data" / "processed" / "fdr_results.parquet"
 OHLCV_PATH     = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
 CFG_PATH       = ROOT / "configs" / "backtest.yaml"
@@ -654,11 +653,11 @@ def main():
     with open(CFG_PATH) as f:
         cfg = yaml.safe_load(f)
 
-    features = get_surviving_features(SHAP_PATH)
-    log(f"  Features for knockoff generation: {len(features)}")
-
     log("\nLoading IS features …")
     feat_df = pd.read_parquet(FEATURES_PATH)
+    # Derive the canonical pre-registered feature set from the loaded frame.
+    features = _feature_columns(feat_df)
+    log(f"  Features for knockoff generation: {len(features)}")
     log("Loading OHLCV …")
     ohlcv   = pd.read_parquet(OHLCV_PATH)
 
