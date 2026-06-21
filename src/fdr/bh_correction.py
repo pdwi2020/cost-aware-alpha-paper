@@ -1,4 +1,9 @@
-"""Benjamini-Hochberg FDR correction and feature IC significance testing."""
+"""Benjamini-Hochberg and Benjamini-Yekutieli FDR corrections.
+
+Shared by run_fdr.py (daily cross-sectional estimand) and run_bhy.py.
+The older compute_ic_tstats / bh_with_regime helpers are retained for
+backward compatibility with any callers that still reference them.
+"""
 
 import numpy as np
 import pandas as pd
@@ -66,6 +71,45 @@ def benjamini_hochberg(
 
     # BH-adjusted p-values: p_adj_(k) = min_{k'>=k} p_(k') * m/k'
     raw_adj     = sorted_p * m / np.arange(1, m + 1)
+    adj_monotone = np.minimum.accumulate(raw_adj[::-1])[::-1]
+    adj_p        = np.empty(m)
+    adj_p[sorted_idx] = np.minimum(adj_monotone, 1.0)
+
+    return reject, adj_p
+
+
+def bhy_procedure(
+    p_values: np.ndarray,
+    q: float = 0.10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Benjamini-Yekutieli (BHY) procedure — valid under arbitrary dependence.
+
+    Uses the effective level q_eff = q / H_m where H_m = sum_{i=1}^{m} 1/i.
+
+    Args:
+        p_values: Array of p-values (one per hypothesis).
+        q: Target FDR level (default 0.10).
+
+    Returns:
+        Tuple of (rejected: bool array, bhy_adjusted_p: float array).
+    """
+    p_arr = np.asarray(p_values, dtype=float)
+    m     = len(p_arr)
+    H_m   = float(np.sum(1.0 / np.arange(1, m + 1)))   # harmonic number
+    q_eff = q / H_m
+
+    sorted_idx = np.argsort(p_arr)
+    sorted_p   = p_arr[sorted_idx]
+    thresholds = np.arange(1, m + 1) * q_eff / m
+    below      = sorted_p <= thresholds
+
+    max_k = int(np.max(np.where(below)[0])) if below.any() else -1
+    reject = np.zeros(m, dtype=bool)
+    if max_k >= 0:
+        reject[sorted_idx[:max_k + 1]] = True
+
+    # BHY-adjusted p-values (rescaled so that BH logic applies at q not q_eff)
+    raw_adj      = sorted_p * m / (np.arange(1, m + 1) * q_eff / q)
     adj_monotone = np.minimum.accumulate(raw_adj[::-1])[::-1]
     adj_p        = np.empty(m)
     adj_p[sorted_idx] = np.minimum(adj_monotone, 1.0)

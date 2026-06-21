@@ -46,6 +46,83 @@ class PortfolioSimulator:
         self.gross_target = self.cfg["gross_exposure_target"]
 
     # ------------------------------------------------------------------
+    # Position cap helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _waterfill_cap(
+        w: pd.Series,
+        max_pos: float,
+        gross_target: float,
+        tol: float = 1e-9,
+        max_iter: int = 100,
+    ) -> pd.Series:
+        """Iterative water-fill cap: enforce |w_i| <= max_pos while keeping
+        sum|w_i| == gross_target (when feasible).
+
+        Algorithm
+        ---------
+        1. Normalise input so gross == gross_target (caller guarantees this,
+           but we guard for safety).
+        2. Identify names with |w_i| > max_pos; clamp them (frozen).
+        3. Redistribute the gross freed by clamping proportionally among the
+           unfrozen names (preserving relative sizes and signs).
+        4. Repeat until no unfrozen name exceeds max_pos (convergence).
+
+        Feasibility: if n_active * max_pos < gross_target the cap constraint
+        cannot be satisfied while meeting the gross target.  In that case every
+        name is capped at max_pos and the returned gross is n_active * max_pos
+        (strictly less than gross_target).  The position cap is NEVER breached.
+        """
+        if max_pos <= 0 or len(w) == 0:
+            return w.copy()
+
+        w = w.copy()
+
+        # Guard: re-normalise to gross_target if needed
+        gross = w.abs().sum()
+        if gross > tol:
+            w = w / gross * gross_target
+
+        frozen = pd.Series(False, index=w.index)
+
+        for _ in range(max_iter):
+            over = w.abs() > max_pos + tol
+            newly_frozen = over & ~frozen
+            if not newly_frozen.any():
+                break  # converged
+
+            # Clamp newly-frozen names
+            w[over] = w[over].clip(-max_pos, max_pos)
+            frozen = frozen | over
+
+            unfrozen = ~frozen
+            if not unfrozen.any():
+                # All names frozen — feasibility exhausted
+                break
+
+            # How much gross do the unfrozen names currently carry?
+            gross_frozen   = w[frozen].abs().sum()
+            gross_unfrozen = w[unfrozen].abs().sum()
+            gross_needed   = gross_target - gross_frozen
+
+            # Feasibility check: can unfrozen names absorb gross_needed?
+            n_unfrozen = unfrozen.sum()
+            max_unfrozen_gross = n_unfrozen * max_pos
+            if gross_needed > max_unfrozen_gross + tol:
+                # Infeasible — cap every unfrozen name at max_pos too
+                w[unfrozen] = w[unfrozen].clip(-max_pos, max_pos)
+                frozen = frozen | unfrozen
+                break
+
+            # Scale unfrozen proportionally to absorb the remaining gross
+            if gross_unfrozen > tol:
+                w[unfrozen] = w[unfrozen] / gross_unfrozen * gross_needed
+            # (if gross_unfrozen == 0 there is nothing to redistribute)
+
+        return w
+
+    # ------------------------------------------------------------------
     # Signal → Positions
     # ------------------------------------------------------------------
 
@@ -106,13 +183,8 @@ class PortfolioSimulator:
                 continue
             w = z / gross * self.gross_target
 
-            # Cap individual positions
-            w = w.clip(-self.max_pos, self.max_pos)
-
-            # Re-normalise after cap
-            gross2 = w.abs().sum()
-            if gross2 > 1e-8:
-                w = w / gross2 * self.gross_target
+            # Cap individual positions (iterative water-fill)
+            w = self._waterfill_cap(w, self.max_pos, self.gross_target)
 
             weights.loc[d, w.index] = w
             last_w = weights.loc[d].copy()
