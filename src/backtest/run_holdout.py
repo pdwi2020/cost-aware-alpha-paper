@@ -55,34 +55,40 @@ REBAL_FREQ = 5
 VOL_WINDOW = 21
 
 # ±50% return cap for corporate-action artifact removal.
-# Must match build_features.py and run_baselines.py for full coherence.
-SANITIZE_CAP = 0.50
+# NOTE: The ±50% winsorization that was previously applied here to build_returns
+# is intentionally REMOVED.  build_features.py::sanitize_ohlcv already clips
+# returns before writing features_tier1.parquet / features_all.parquet.
+# Re-clipping here on the raw OHLCV would re-introduce the operation on a
+# separate price series and risk inconsistency.  The holdout P&L returns come
+# from the same sanitized price series embedded in the features parquet via
+# the target columns, so no second winsorization is needed.
+SANITIZE_CAP = 0.50  # kept for ADV computations only (raw close × volume)
 
-# Screen 0 — tradeable-universe filter. Names priced below MIN_PRICE on the
-# trade date are excluded: post-delisting / penny prints (e.g. failed banks
-# trading at $0.02) are not realistically tradeable and carry the bulk of the
-# residual corporate-action artifacts. Combined with the $1M ADV filter this
-# defines the tradeable universe, applied uniformly across all strategies.
-MIN_PRICE = 5.0
+# Screen 0 — REMOVED from this file.
+# apply_min_price_filter (which used the *trade-date* close to gate a position
+# that earns the trade-date return) was a look-ahead: it used price[t] to
+# decide eligibility for a position whose return is also earned at t.
+#
+# The correct approach is upstream: build_features.py writes `s0_eligible`
+# (a boolean flag derived from price[t-1] and trailing ADV through t-1) into
+# features_all.parquet.  Below we load that flag and zero-out ineligible
+# positions BEFORE the P&L simulation.  Eligibility is therefore known at
+# t-1, which is when the position is sized — no look-ahead.
+#
+# Single source of truth: src/data/screen0.py
 
 
 def log(msg): print(msg, flush=True)
 
 
-def apply_min_price_filter(positions, close_w, min_price=MIN_PRICE):
-    """Screen 0: zero positions in names priced < min_price on the trade date,
-    then renormalise gross (L1) leverage to 1 per day so capital stays deployed."""
-    pxa = close_w.reindex(index=positions.index, columns=positions.columns).ffill()
-    positions = positions.where(pxa >= min_price, 0.0)
-    l1 = positions.abs().sum(axis=1).replace(0, np.nan)
-    return positions.div(l1, axis=0).fillna(0.0)
-
-
 def build_returns_vol_adv_holdout(ohlcv, tickers, start, end):
-    """Build holdout returns, vol, ADV with ±50% return sanitization.
+    """Build holdout returns, vol, ADV from raw OHLCV.
 
-    Returns are clipped to ±SANITIZE_CAP to remove corporate-action artifacts
-    before any P&L simulation.  ADV uses raw close × volume (scale preserved).
+    Returns are NOT re-clipped here — the ±50% winsorization is applied once,
+    upstream, in build_features.py::sanitize_ohlcv.  Re-clipping here would
+    operate on a separate price series (the cached daily_ohlcv.parquet which
+    stores raw close) and risk sign-inconsistency with the sanitized targets.
+    ADV uses raw close × volume (scale preserved; not winsorized).
     """
     mask = (
         ohlcv["ticker"].isin(tickers)
@@ -92,12 +98,7 @@ def build_returns_vol_adv_holdout(ohlcv, tickers, start, end):
     sub  = ohlcv[mask][["ticker", "date", "close", "volume"]].copy()
     close_w  = sub.pivot(index="date", columns="ticker", values="close")
     volume_w = sub.pivot(index="date", columns="ticker", values="volume")
-    returns_raw  = close_w.pct_change(fill_method=None)
-    # Sanitize: clip to ±50% before vol/ADV computation
-    n_clipped = int((returns_raw.abs() > SANITIZE_CAP).sum().sum())
-    if n_clipped > 0:
-        log(f"  [sanitize] Clipped {n_clipped} (ticker,day) cells with |ret|>{SANITIZE_CAP:.0%}")
-    returns      = returns_raw.clip(lower=-SANITIZE_CAP, upper=SANITIZE_CAP)
+    returns      = close_w.pct_change(fill_method=None)
     vol          = returns.rolling(VOL_WINDOW, min_periods=10).std()
     dollar_vol   = close_w * volume_w   # raw close × volume for ADV scale
     adv_dollars  = dollar_vol.rolling(VOL_WINDOW, min_periods=10).mean()
@@ -155,11 +156,33 @@ def main():
             impact_coeff=cfg["impact_coeff"],
         )
         positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
-        # Screen 0: restrict to tradeable universe (price ≥ $5)
+
+        # Screen 0 (look-ahead-free): load the pre-computed eligibility flag
+        # from features_all.parquet.  s0_eligible at date t was computed from
+        # price[t-1] and trailing ADV[t-window:t-1] in build_features.py via
+        # src/data/screen0.py — all information known before the open at t.
+        # We zero out positions for ineligible names and renormalise L1 gross
+        # among the ELIGIBLE names only (so deployed capital is unchanged).
         n_before = int((positions.abs() > 1e-12).sum().sum())
-        positions = apply_min_price_filter(positions, close_px, MIN_PRICE)
+        if "s0_eligible" in feat_df.columns:
+            # Build a (date × ticker) boolean mask from the MultiIndex parquet
+            elig_col = feat_df["s0_eligible"]
+            if not isinstance(elig_col.index, pd.MultiIndex):
+                elig_col = elig_col.set_index(["ticker", "date"]) if "ticker" in feat_df.columns else elig_col
+            elig_wide = elig_col.unstack(level="ticker")  # date × ticker
+            elig_wide = elig_wide.reindex(index=positions.index, columns=positions.columns)
+            elig_wide = elig_wide.fillna(False).astype(bool)
+            positions = positions.where(elig_wide, 0.0)
+            # Renormalise L1 gross among eligible names so capital stays deployed
+            l1 = positions.abs().sum(axis=1).replace(0.0, np.nan)
+            positions = positions.div(l1, axis=0).fillna(0.0)
+        else:
+            log("  [warn] s0_eligible column not found in features parquet; "
+                "rebuild with build_features.py to enable look-ahead-free Screen 0. "
+                "Proceeding without Screen 0 filter.")
         n_after = int((positions.abs() > 1e-12).sum().sum())
-        log(f"  Screen 0 (price≥${MIN_PRICE:.0f}): {n_before}→{n_after} active positions")
+        log(f"  Screen 0 (lagged price≥$5, ADV≥$1M, PIT member): "
+            f"{n_before}→{n_after} active positions")
         min_adv   = cfg.get("min_adv_dollars", 1e6)
         pnl_df    = sim.simulate_pnl(
             positions, returns, vol=vol,

@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from src.data.universe_builder import get_universe_tickers
+from src.data.screen0 import screen0_eligibility, survivorship_delta
 from src.features.tier1_classic import build_tier1_features, compute_residualized_returns
 
 CATALOG  = os.environ.get("DUCKDB_CATALOG", "/Volumes/Crucial X9/data/catalog.duckdb")
@@ -264,8 +265,14 @@ def main() -> pd.DataFrame:
         "--no-sanitize", action="store_true",
         help="Disable ±50%% return-cap sanitization (reproduce original raw behavior)"
     )
+    parser.add_argument(
+        "--universe", choices=["pit", "liquidity"], default="pit",
+        help="Screen 0 universe: 'pit' (point-in-time S&P 500 annual, default) "
+             "or 'liquidity' (top-N by trailing ADV, fully reconstructible)."
+    )
     args = parser.parse_args()
     sanitize = not args.no_sanitize
+    universe_choice = args.universe
     cap = SANITIZE_CAP if sanitize else None
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -353,6 +360,49 @@ def main() -> pd.DataFrame:
         (out.index.get_level_values("date") <= UNIVERSE_END)
     ]
     out = out.dropna(subset=feat_cols, how="all")
+
+    # --- Screen 0: PIT membership + lagged price/ADV eligibility flags ---
+    # Compute eligibility from the daily OHLCV panel (which has close_raw after
+    # sanitization, or close if --no-sanitize).  All three criteria use only
+    # data ≤ t-1; see src/data/screen0.py for details.
+    print(f"\n=== Screen 0 Eligibility (universe={universe_choice!r}) ===")
+    t_s0 = time.time()
+    # Rebuild the daily panel subset that matches the filtered `out` index
+    # (use `daily` which has close_raw from sanitize_ohlcv, or close if raw)
+    daily_for_screen = daily.copy()
+    daily_for_screen["date"] = pd.to_datetime(daily_for_screen["date"])
+
+    s0_series = screen0_eligibility(
+        daily_for_screen, str(SP500_DIR), universe=universe_choice
+    )
+    # trailing ADV (lagged) — reuse the same window for the column we attach
+    from src.data.screen0 import trailing_adv_usd as _adv_fn
+    adv_series = _adv_fn(daily_for_screen)
+
+    # Attach columns to `out` (align on the (ticker, date) MultiIndex)
+    out["s0_eligible"] = s0_series.reindex(out.index)
+    out["in_universe"] = out["s0_eligible"]  # alias for clarity; same value
+    out["adv_usd"]     = adv_series.reindex(out.index)
+
+    n_eligible = int(out["s0_eligible"].sum())
+    n_total    = len(out)
+    print(f"  Eligible rows: {n_eligible:,} / {n_total:,} "
+          f"({100*n_eligible/n_total:.1f}%)  [{time.time()-t_s0:.0f}s]")
+
+    # Survivorship-bias delta: quantify what the union→PIT switch removes
+    s_delta = survivorship_delta(daily_for_screen, str(SP500_DIR))
+    print(f"  Survivorship delta (union vs PIT): {s_delta}")
+    try:
+        from src.manifest import record as _manifest_record
+        _manifest_record(
+            "universe.survivorship_delta",
+            s_delta,
+            stage="screen0",
+            universe=universe_choice,
+            meta={"adv_window": 21, "min_price_usd": 5.0, "min_adv_usd": 1_000_000},
+        )
+    except Exception as _e:
+        print(f"  [warn] manifest record failed: {_e}")
 
     # --- Artifact count report (before = raw bak, after = this run) ---
     ret_feats_chk = ['ret_1d','ret_5d','ret_21d','ret_63d','reversal_1w','reversal_4w']

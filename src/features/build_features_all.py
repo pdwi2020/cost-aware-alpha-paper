@@ -19,6 +19,7 @@ Prerequisites:
     data/processed/daily_ohlcv.parquet     (from build_features.py)
 """
 
+import argparse
 import os
 import sys
 import time
@@ -34,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
 from src.data.universe_builder import get_universe_tickers
+from src.data.screen0 import screen0_eligibility, trailing_adv_usd, survivorship_delta
 from src.features.tier2_extended import build_tier2_features
 
 # ±50% daily return cap for corporate-action artifact removal in Tier-2 features.
@@ -88,6 +90,15 @@ UNIVERSE_END   = "2024-12-31"
 
 
 def main() -> pd.DataFrame:
+    parser = argparse.ArgumentParser(description="Week 3: Full Feature Engineering (Tier 1 + Tier 2)")
+    parser.add_argument(
+        "--universe", choices=["pit", "liquidity"], default="pit",
+        help="Screen 0 universe: 'pit' (point-in-time S&P 500 annual, default) "
+             "or 'liquidity' (top-N by trailing ADV, fully reconstructible)."
+    )
+    args = parser.parse_args()
+    universe_choice = args.universe
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=== Week 3: Full Feature Engineering (Tier 1 + Tier 2) ===\n")
@@ -167,7 +178,47 @@ def main() -> pd.DataFrame:
     out = out.dropna(subset=feat_cols, how="all")
 
     # ------------------------------------------------------------------
-    # 8. Summary
+    # 8. Screen 0: PIT membership + lagged price/ADV eligibility flags
+    #    Uses the sanitized OHLCV (`daily`) which has close_raw after
+    #    _sanitize_ohlcv_for_tier2 renamed columns; if not present falls
+    #    back to close.  All criteria use only data ≤ t-1 (look-ahead free).
+    #    See src/data/screen0.py for implementation details.
+    # ------------------------------------------------------------------
+    print(f"\n=== Screen 0 Eligibility (universe={universe_choice!r}) ===")
+    t_s0 = time.time()
+    daily_for_screen = daily.copy()
+    daily_for_screen["date"] = pd.to_datetime(daily_for_screen["date"])
+
+    s0_series  = screen0_eligibility(
+        daily_for_screen, str(SP500_DIR), universe=universe_choice
+    )
+    adv_series = trailing_adv_usd(daily_for_screen)
+
+    out["s0_eligible"] = s0_series.reindex(out.index)
+    out["in_universe"] = out["s0_eligible"]
+    out["adv_usd"]     = adv_series.reindex(out.index)
+
+    n_eligible = int(out["s0_eligible"].sum())
+    n_total    = len(out)
+    print(f"  Eligible rows: {n_eligible:,} / {n_total:,} "
+          f"({100*n_eligible/n_total:.1f}%)  [{time.time()-t_s0:.0f}s]")
+
+    s_delta = survivorship_delta(daily_for_screen, str(SP500_DIR))
+    print(f"  Survivorship delta (union vs PIT): {s_delta}")
+    try:
+        from src.manifest import record as _manifest_record
+        _manifest_record(
+            "universe.survivorship_delta",
+            s_delta,
+            stage="screen0",
+            universe=universe_choice,
+            meta={"adv_window": 21, "min_price_usd": 5.0, "min_adv_usd": 1_000_000},
+        )
+    except Exception as _e:
+        print(f"  [warn] manifest record failed: {_e}")
+
+    # ------------------------------------------------------------------
+    # 9. Summary
     # ------------------------------------------------------------------
     dates = out.index.get_level_values("date")
     tier1_feats = [c for c in out.columns if c in tier1.columns and not c.startswith("target")]
