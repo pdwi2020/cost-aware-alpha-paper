@@ -1,8 +1,22 @@
 """Week 3: Full feature pipeline — Tier 1 + Tier 2 merged.
 
 Loads Tier 1 from parquet, computes Tier 2 features (intraday microstructure,
-cross-asset macro, crowding proxies), adds the term_spread × mom_12_1
-interaction term, merges, and saves features_all.parquet.
+cross-asset macro, crowding proxies), adds the three prespecified interactions
+(beta_x_vix, beta_x_term_spread, credit_beta_x_credit), merges, and saves
+features_all.parquet.
+
+Interaction formulas (all look-ahead-free):
+  market_beta_lagged  = rolling_cov(r_i, r_mkt) / rolling_var(r_mkt) over 252d,
+                        then shifted 1 day per ticker (uses only t-1 returns).
+  credit_beta_lagged  = rolling_cov(r_i, d_credit) / rolling_var(d_credit) over 252d,
+                        then shifted 1 day per ticker.
+  beta_x_vix          = market_beta_lagged * vix           (vix already lag-1 in frame)
+  beta_x_term_spread  = market_beta_lagged * term_spread_chg_21d  (already lag-1)
+  credit_beta_x_credit = credit_beta_lagged * credit_proxy_chg_5d (already lag-1)
+
+Broadcast-only columns (vix, term_spread, etc.) are DROPPED from the final feature
+set via feature_spec.feature_columns(), but vix and term_spread are retained as
+regime labels (regime_vix / regime_term_spread).
 
 SANITIZATION NOTE:
     Tier-1 features (including return-derived columns and both targets) are
@@ -37,10 +51,60 @@ load_dotenv(ROOT / ".env")
 from src.data.universe_builder import get_universe_tickers
 from src.data.screen0 import screen0_eligibility, trailing_adv_usd, survivorship_delta
 from src.features.tier2_extended import build_tier2_features
+from src.features.feature_spec import feature_columns as _feature_columns
 
 # ±50% daily return cap for corporate-action artifact removal in Tier-2 features.
 # Must match build_features.py SANITIZE_CAP for full coherence.
 SANITIZE_CAP_T2 = 0.50
+
+BETA_WINDOW = 252   # rolling OLS window for market / credit beta estimation
+
+
+def _compute_rolling_beta(
+    stock_ret_wide: pd.DataFrame,
+    factor_series: pd.Series,
+    window: int = BETA_WINDOW,
+) -> pd.DataFrame:
+    """Rolling OLS slope of each stock return on a single factor series.
+
+    Uses the formula: beta(t) = rolling_cov(r_i, f) / rolling_var(f)
+    computed over the `window` trailing days ending at t (inclusive).
+
+    The result is then .shift(1) per ticker so that beta used on date t
+    reflects only returns through t-1 — no look-ahead.
+
+    Parameters
+    ----------
+    stock_ret_wide : pd.DataFrame, shape (dates, tickers)
+        Daily stock returns, wide format.
+    factor_series  : pd.Series, shape (dates,)
+        Daily factor values (e.g. mkt_rf, daily credit-proxy change).
+        Must share the same index as stock_ret_wide.
+    window         : int
+        Rolling window length in trading days.
+
+    Returns
+    -------
+    pd.DataFrame, same shape as stock_ret_wide
+        Rolling betas, shifted 1 day so position [t] uses data through t-1.
+    """
+    # Align factor to stock index
+    f = factor_series.reindex(stock_ret_wide.index).ffill()
+
+    # Rolling covariance of each stock with the factor
+    # pandas rolling().cov(other) computes cov(self, other)
+    rolling_cov = stock_ret_wide.rolling(window).cov(f)      # (dates, tickers)
+    rolling_var = f.rolling(window).var()                     # (dates,)
+
+    # beta = cov / var; broadcast var along ticker axis
+    beta_wide = rolling_cov.div(rolling_var, axis=0)
+
+    # Shift 1 day: beta at t now uses returns through t-1 only (no look-ahead).
+    # beta_wide is (dates × tickers) with a DatetimeIndex shared by all tickers,
+    # so a single .shift(1) uniformly lags every ticker by one date row.
+    beta_lagged = beta_wide.shift(1)
+
+    return beta_lagged
 
 
 def _sanitize_ohlcv_for_tier2(daily: pd.DataFrame, cap: float) -> pd.DataFrame:
@@ -158,12 +222,137 @@ def main() -> pd.DataFrame:
     out = tier1.join(tier2, how="left")
 
     # ------------------------------------------------------------------
-    # 6. Interaction term: term_spread × mom_12_1
-    #    Both features are already lag-1 in tier1, so NO extra shift.
+    # 6. Prespecified interactions (look-ahead-free)
+    #
+    # Three stock-level macro interaction features replace the old
+    # term_spread_x_mom interaction.  Each multiplies a STOCK-SPECIFIC
+    # rolling beta (lagged 1 day) by a broadcast macro level that is
+    # already lag-1 in the feature frame (tier1 broadcast columns were
+    # already .shift(1) in tier1_classic.py::build_tier1_features).
+    #
+    # Betas are computed from the sanitized daily OHLCV (same prices used
+    # for all other return-derived features).
+    #
+    # market_beta_lagged = rolling_cov(r_i, r_mkt) / rolling_var(r_mkt),
+    #                      shifted 1 day (uses returns ≤ t-1 only).
+    # credit_beta_lagged = rolling_cov(r_i, d_credit) / rolling_var(d_credit),
+    #                      shifted 1 day (uses returns ≤ t-1 only).
     # ------------------------------------------------------------------
-    if "term_spread" in out.columns and "mom_12_1" in out.columns:
-        out["term_spread_x_mom"] = out["term_spread"] * out["mom_12_1"]
-        print("  Added interaction: term_spread × mom_12_1")
+    print("\n  Computing prespecified interaction features...")
+
+    # Build wide daily return panel (sanitized close from daily_ohlcv)
+    close_wide_beta = daily.pivot(index="date", columns="ticker", values="close")
+    close_wide_beta.index = pd.to_datetime(close_wide_beta.index)
+    stock_ret_wide = close_wide_beta.pct_change(fill_method=None)
+
+    # ------------------------------------------------------------------
+    # 6a. Market beta — factor = mkt_rf (Fama-French market excess return)
+    # ------------------------------------------------------------------
+    # Load factors from DuckDB for mkt_rf
+    try:
+        mkt_rf_series = None
+        # Attempt to read from DuckDB (already open in the scope above as `db`)
+        ff5_df = db.execute("SELECT * FROM ff_famafrench_ff5_daily").fetchdf()
+        ff5_df["date"] = pd.to_datetime(ff5_df["date"]).dt.normalize()
+        mkt_rf_col = "Mkt-RF" if "Mkt-RF" in ff5_df.columns else "mkt_rf"
+        if mkt_rf_col in ff5_df.columns:
+            mkt_rf_series = (
+                ff5_df.set_index("date")[mkt_rf_col] / 100.0
+            ).reindex(stock_ret_wide.index).ffill()
+            print(f"    mkt_rf loaded: {mkt_rf_series.notna().sum()} valid days")
+    except Exception as _e:
+        print(f"    [warn] Could not load mkt_rf: {_e}; skipping market-beta interactions")
+        mkt_rf_series = None
+
+    if mkt_rf_series is not None:
+        market_beta_lagged_wide = _compute_rolling_beta(
+            stock_ret_wide, mkt_rf_series, window=BETA_WINDOW
+        )
+        # Long-format: stack (date, ticker) → Series
+        mbl_long = (
+            market_beta_lagged_wide.stack(future_stack=True)
+            .rename("_market_beta_lagged")
+            .reset_index()
+        )
+        mbl_long.columns = ["date", "ticker", "_market_beta_lagged"]
+        mbl_long["date"] = pd.to_datetime(mbl_long["date"])
+        out = out.reset_index().merge(mbl_long, on=["ticker", "date"], how="left")
+        out = out.set_index(["ticker", "date"]).sort_index()
+
+        # beta_x_vix: market_beta_lagged * vix (vix already lag-1 in frame)
+        if "vix" in out.columns:
+            out["beta_x_vix"] = out["_market_beta_lagged"] * out["vix"]
+            print("    Added interaction: beta_x_vix = market_beta_lagged × vix")
+
+        # beta_x_term_spread: market_beta_lagged * term_spread_chg_21d (already lag-1)
+        if "term_spread_chg_21d" in out.columns:
+            out["beta_x_term_spread"] = out["_market_beta_lagged"] * out["term_spread_chg_21d"]
+            print("    Added interaction: beta_x_term_spread = market_beta_lagged × term_spread_chg_21d")
+
+        # Drop the helper column
+        out.drop(columns=["_market_beta_lagged"], inplace=True)
+
+    # ------------------------------------------------------------------
+    # 6b. Credit beta — factor = daily change in credit_proxy
+    # ------------------------------------------------------------------
+    credit_beta_ok = False
+    if "credit_proxy" in out.columns:
+        # Reconstruct the daily credit-proxy level (date-indexed, before lag-1 was
+        # applied in tier2_extended).  The tier2 macro pipeline already created
+        # credit_proxy = DGS10 - DFF; we can recover it from the feature frame by
+        # un-shifting (the original unshifted series is the same per date for all
+        # tickers, so we take the per-date median to undo NaN from edge tickers).
+        # More robustly: re-derive from DuckDB directly.
+        try:
+            fred_df = db.execute("SELECT * FROM fred_macro").fetchdf()
+            fred_df["date"] = pd.to_datetime(fred_df["date"]).dt.normalize()
+            fred_pivot = fred_df.pivot_table(
+                index="date", columns="series_id", values="value", aggfunc="last"
+            ).ffill()
+            if "DGS10" in fred_pivot.columns and "DFF" in fred_pivot.columns:
+                credit_proxy_raw = (fred_pivot["DGS10"] - fred_pivot["DFF"]).reindex(
+                    stock_ret_wide.index
+                ).ffill()
+                # Daily change in credit proxy (used as the factor)
+                d_credit = credit_proxy_raw.diff(1)
+
+                credit_beta_lagged_wide = _compute_rolling_beta(
+                    stock_ret_wide, d_credit, window=BETA_WINDOW
+                )
+                cbl_long = (
+                    credit_beta_lagged_wide.stack(future_stack=True)
+                    .rename("_credit_beta_lagged")
+                    .reset_index()
+                )
+                cbl_long.columns = ["date", "ticker", "_credit_beta_lagged"]
+                cbl_long["date"] = pd.to_datetime(cbl_long["date"])
+                out = out.reset_index().merge(cbl_long, on=["ticker", "date"], how="left")
+                out = out.set_index(["ticker", "date"]).sort_index()
+
+                # credit_beta_x_credit: credit_beta_lagged * credit_proxy_chg_5d (already lag-1)
+                if "credit_proxy_chg_5d" in out.columns:
+                    out["credit_beta_x_credit"] = (
+                        out["_credit_beta_lagged"] * out["credit_proxy_chg_5d"]
+                    )
+                    print("    Added interaction: credit_beta_x_credit = credit_beta_lagged × credit_proxy_chg_5d")
+                    credit_beta_ok = True
+
+                out.drop(columns=["_credit_beta_lagged"], inplace=True)
+        except Exception as _e:
+            print(f"    [warn] Could not compute credit_beta: {_e}")
+
+    if not credit_beta_ok:
+        print("    [warn] credit_beta_x_credit not added (credit_proxy or DuckDB unavailable)")
+
+    # ------------------------------------------------------------------
+    # 6c. Retain broadcast columns as regime labels (renamed), then drop
+    #     from the feature set via feature_spec.feature_columns() below.
+    # ------------------------------------------------------------------
+    if "vix" in out.columns:
+        out["regime_vix"] = out["vix"]
+    if "term_spread" in out.columns:
+        out["regime_term_spread"] = out["term_spread"]
+    print("  Retained regime labels: regime_vix, regime_term_spread")
 
     # ------------------------------------------------------------------
     # 7. Filter to universe window and drop fully-NaN feature rows
@@ -176,6 +365,20 @@ def main() -> pd.DataFrame:
     target_cols = [c for c in out.columns if c.startswith("target")]
     feat_cols   = [c for c in out.columns if c not in target_cols]
     out = out.dropna(subset=feat_cols, how="all")
+
+    # ------------------------------------------------------------------
+    # 7b. Derive the canonical final feature set via feature_spec.
+    #     DROPPED columns (broadcast-only, duplicates, old interaction)
+    #     are excluded from the signal set but regime labels and universe
+    #     flags are retained separately.
+    # ------------------------------------------------------------------
+    final_feat_list = _feature_columns(out)
+    _non_feat_cols = set(target_cols) | {"s0_eligible", "in_universe", "adv_usd",
+                                          "regime_vix", "regime_term_spread"}
+    print(f"\n  Final pre-registered feature set ({len(final_feat_list)} features):")
+    for _f in final_feat_list:
+        print(f"    {_f}")
+    print(f"  Non-feature cols retained: {sorted(_non_feat_cols & set(out.columns))}")
 
     # ------------------------------------------------------------------
     # 8. Screen 0: PIT membership + lagged price/ADV eligibility flags
@@ -213,6 +416,18 @@ def main() -> pd.DataFrame:
             stage="screen0",
             universe=universe_choice,
             meta={"adv_window": 21, "min_price_usd": 5.0, "min_adv_usd": 1_000_000},
+        )
+        from src.features.feature_spec import DROPPED as _SPEC_DROPPED, ADDED_INTERACTIONS as _ADDED
+        _manifest_record(
+            "features.final_list",
+            final_feat_list,
+            stage="features",
+            meta={
+                "n_features": len(final_feat_list),
+                "n_kept": len([f for f in final_feat_list if f not in _ADDED]),
+                "n_interactions": len([f for f in final_feat_list if f in _ADDED]),
+                "dropped": sorted(_SPEC_DROPPED),
+            },
         )
     except Exception as _e:
         print(f"  [warn] manifest record failed: {_e}")

@@ -37,27 +37,35 @@ sys.path.insert(0, str(ROOT))
 from src.models.model_suite import make_fold_dates
 from src.fdr.bh_correction import compute_ic_tstats, benjamini_hochberg, bh_with_regime
 from src.universe_paths import proc
+from src.features.feature_spec import feature_columns as _feature_columns
 
 FEATURES_PATH  = proc(ROOT, "features_all.parquet")
-SHAP_PATH      = proc(ROOT, "shap_summary.parquet")
 OUT_RESULTS    = proc(ROOT, "fdr_results.parquet")
 OUT_REGIME     = proc(ROOT, "fdr_regime.parquet")
 
 FDR_Q          = 0.10
 VIX_CALM_THRESH = 20.0
 
-# Features with near-zero SHAP across all models → excluded before BH
-SHAP_DROPPED = {"corr_XLRE", "corr_XLC", "term_spread_x_mom"}
+# SHAP_DROPPED has been removed per spec.yaml:features:remove_shap_preselection.
+# The full pre-registered set is determined by feature_spec.feature_columns(df).
 
 
 def log(msg): print(msg, flush=True)
 
 
-def get_surviving_features(shap_path: Path) -> list:
-    shap_df  = pd.read_parquet(shap_path)
-    all_feat = shap_df["feature"].unique().tolist()
-    surviving = [f for f in all_feat if f not in SHAP_DROPPED]
-    return sorted(surviving)
+def get_surviving_features(features_df: pd.DataFrame) -> list:
+    """Return the pre-registered feature list from the feature frame.
+
+    Uses feature_spec.feature_columns() — the single source of truth —
+    so the BH test count equals exactly the number of pre-registered
+    features present in the data (no silent SHAP-based pre-drops).
+
+    Parameters
+    ----------
+    features_df : pd.DataFrame
+        The features_all.parquet frame (used solely for column intersection).
+    """
+    return _feature_columns(features_df)
 
 
 def compute_fold_ics(
@@ -142,17 +150,19 @@ def main():
     log("=== Week 6: Feature IC Significance (BH FDR) ===\n")
     t0 = time.time()
 
-    features   = get_surviving_features(SHAP_PATH)
-    fold_dates = make_fold_dates()
-    log(f"  Surviving features after SHAP pre-screen: {len(features)}")
-    log(f"  Dropped: {sorted(SHAP_DROPPED)}")
-    log(f"  Folds: {[fd['fold_id'] for fd in fold_dates]}")
-    log(f"  FDR q = {FDR_Q}\n")
-
     df = pd.read_parquet(FEATURES_PATH)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
     )
+
+    # Full pre-registered feature set — no SHAP-based pre-selection.
+    # BH is applied to exactly these features.
+    features   = get_surviving_features(df)
+    fold_dates = make_fold_dates()
+    log(f"  Pre-registered features for BH test: {len(features)}")
+    log(f"  Features: {features}")
+    log(f"  Folds: {[fd['fold_id'] for fd in fold_dates]}")
+    log(f"  FDR q = {FDR_Q}\n")
 
     all_results = []
     all_regime  = []
