@@ -31,6 +31,21 @@ point-in-time pipeline (commits up to `5e4eae2`). Every number below is in
    alpha, catches the raw-return false discovery, and counsels (correctly) that a single short-window
    positive OOS Sharpe is not evidence of alpha.
 
+## Confirmatory evidence (the conclusion holds across 8 independent tests)
+| Test | Track A result | Reading |
+|---|---|---|
+| IC-FDR | 12/30 significant | real cross-sectional signal |
+| TA-FDR (cost-aware) | **0/30** | not tradable as single-feature strategies |
+| IS net Sharpe (weekly) | **+0.188** | modest |
+| **Deflated Sharpe Ratio** | **0.12–0.21 (fails 0.95)** | IS Sharpe within data-mining noise for the search |
+| Exploratory 2022–24 | **−0.61** | corrected pipeline is NEGATIVE on the window the old paper claimed +0.357 |
+| Locked OOS 2025 | +0.666, **p=0.62** | indistinguishable from zero (7-month window) |
+| Ex-mega-cap | **−0.22** | apparent edge concentrated in the 25 largest names |
+| Baselines | momentum +0.99 net OOS | plain 12-1 momentum dominates the reversal signal |
+
+Track A net Sharpe sign **flips** across IS(+0.19)/exploratory(−0.61)/OOS(+0.67 insig.) — there is no
+stable, deflation-surviving, cost-surviving edge. This is the protocol working as intended.
+
 ## Methodological fixes (all committed, 58 unit tests)
 PIT universe + look-ahead-free Screen 0 (R1) · feature dedup/de-broadcast + β×macro interactions (R2) ·
 daily-XS FDR with **recentered/calibrated** bootstrap p-values (R3; an anti-conservative
