@@ -160,7 +160,11 @@ def main():
         log(f"  Track: {track.upper()}")
         log(f"{'='*60}")
 
-        weights = build_signal_weights(track, fdr_df, shap_df)
+        try:
+            weights = build_signal_weights(track, fdr_df, shap_df)
+        except ValueError as e:
+            log(f"  [SKIP] {e}")
+            continue
         sig = generate_composite_signal(
             feat_df_excl, weights,
             start_date=HOLDOUT_START,

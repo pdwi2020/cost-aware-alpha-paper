@@ -273,7 +273,11 @@ def main():
     fdr_df  = pd.read_parquet(FDR_PATH)
     shap_df = pd.read_parquet(SHAP_PATH)
     feat_df = pd.read_parquet(FEAT_PATH)
-    weights_b = build_signal_weights("track_b", fdr_df, shap_df)
+    try:
+        weights_b = build_signal_weights("track_b", fdr_df, shap_df)
+    except ValueError as e:
+        log(f"  [INFO] Track B signal weights unavailable ({e}); Track B gross-only baseline will be skipped.")
+        weights_b = None
 
     all_pnl     = []
     all_metrics = []
@@ -366,34 +370,37 @@ def main():
         log(f"  Reversal L/S: gross SR={rev_m['gross_sr']:+.3f}  net SR={rev_m['net_sr']:+.3f}")
 
         # ── 4. Track B gross-only (zero costs) ──────────────────────────
-        sig_b = generate_composite_signal(feat_df, weights_b,
-                                           start_date=start, end_date=end)
-        tickers_b = sig_b.columns.tolist()
-        ret_b  = returns.reindex(columns=tickers_b).fillna(0)
-        vol_b  = vol.reindex(columns=tickers_b).fillna(0.02)
-        adv_b  = adv.reindex(columns=tickers_b).fillna(1e8)
-        positions_b = sim_free.signal_to_positions(sig_b, lag=1, rebal_freq=REBAL_FREQ)
-        pnl_b = sim_free.simulate_pnl(positions_b, ret_b, vol=vol_b,
-                                       adv_dollars=adv_b,
-                                       aum_dollars=cfg.get("aum_dollars", 1e8),
-                                       min_adv_dollars=0.0)
-        mb  = sim_free.compute_metrics(pnl_b)
-        bm  = {
-            "strategy": "Track B (gross, no cost)",
-            "period":   period,
-            "gross_sr": mb.get("gross_pnl_sharpe", np.nan),
-            "net_sr":   mb.get("net_pnl_sharpe",   np.nan),
-            "gross_ann": mb.get("gross_pnl_annual", np.nan),
-            "net_ann":   mb.get("net_pnl_annual",   np.nan),
-            "max_dd":    mb.get("net_pnl_max_dd",   np.nan),
-            "annual_to": mb.get("annual_turnover",  np.nan),
-            "cost_drag": 0.0,
-        }
-        pnl_b["strategy"] = "Track B (gross, no cost)"
-        pnl_b["period"]   = period
-        all_pnl.append(pnl_b)
-        all_metrics.append(bm)
-        log(f"  Track B gross-only: gross SR={bm['gross_sr']:+.3f}")
+        if weights_b is not None:
+            sig_b = generate_composite_signal(feat_df, weights_b,
+                                               start_date=start, end_date=end)
+            tickers_b = sig_b.columns.tolist()
+            ret_b  = returns.reindex(columns=tickers_b).fillna(0)
+            vol_b  = vol.reindex(columns=tickers_b).fillna(0.02)
+            adv_b  = adv.reindex(columns=tickers_b).fillna(1e8)
+            positions_b = sim_free.signal_to_positions(sig_b, lag=1, rebal_freq=REBAL_FREQ)
+            pnl_b = sim_free.simulate_pnl(positions_b, ret_b, vol=vol_b,
+                                           adv_dollars=adv_b,
+                                           aum_dollars=cfg.get("aum_dollars", 1e8),
+                                           min_adv_dollars=0.0)
+            mb  = sim_free.compute_metrics(pnl_b)
+            bm  = {
+                "strategy": "Track B (gross, no cost)",
+                "period":   period,
+                "gross_sr": mb.get("gross_pnl_sharpe", np.nan),
+                "net_sr":   mb.get("net_pnl_sharpe",   np.nan),
+                "gross_ann": mb.get("gross_pnl_annual", np.nan),
+                "net_ann":   mb.get("net_pnl_annual",   np.nan),
+                "max_dd":    mb.get("net_pnl_max_dd",   np.nan),
+                "annual_to": mb.get("annual_turnover",  np.nan),
+                "cost_drag": 0.0,
+            }
+            pnl_b["strategy"] = "Track B (gross, no cost)"
+            pnl_b["period"]   = period
+            all_pnl.append(pnl_b)
+            all_metrics.append(bm)
+            log(f"  Track B gross-only: gross SR={bm['gross_sr']:+.3f}")
+        else:
+            log("  [SKIP] Track B gross-only: no BH-rejected features (weights unavailable)")
 
     # ── Save ─────────────────────────────────────────────────────────────
     pnl_out = pd.concat([p for p in all_pnl], axis=0)

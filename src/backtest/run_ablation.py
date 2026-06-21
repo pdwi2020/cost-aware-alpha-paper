@@ -121,18 +121,22 @@ def main():
 
     # FDR-selected features for Track B
     fdr_b = fdr_df[fdr_df.track == TRACK]
-    bh_features = fdr_b.loc[fdr_b.rejected, "feature"].tolist()
+    bh_features = fdr_b.loc[fdr_b.bh_rejected, "feature"].tolist()
     all_features = fdr_b["feature"].tolist()   # all 35 SHAP-surviving features
 
-    fdr_sign_bh  = {r.feature: np.sign(r.mean_ic) for _, r in fdr_b[fdr_b.rejected].iterrows()}
-    fdr_sign_all = {r.feature: np.sign(r.mean_ic) for _, r in fdr_b.iterrows()}
+    if not all_features:
+        log(f"  [SKIP] No features found for {TRACK} — aborting ablation.")
+        return
+
+    fdr_sign_bh  = {r.feature: np.sign(r.ic_bar) for _, r in fdr_b[fdr_b.bh_rejected].iterrows()}
+    fdr_sign_all = {r.feature: np.sign(r.ic_bar) for _, r in fdr_b.iterrows()}
 
     # SHAP weights for Track B (average across models and folds)
     shap_b = shap_df[shap_df.track == TRACK] if "track" in shap_df.columns else shap_df
     shap_agg = shap_b.groupby("feature")["mean_abs_shap"].mean()
     shap_agg = shap_agg / shap_agg.sum()  # normalise
-    shap_weights_bh  = {f: float(shap_agg.get(f, 1.0 / len(bh_features)))  for f in bh_features}
-    shap_weights_all = {f: float(shap_agg.get(f, 1.0 / len(all_features))) for f in all_features}
+    shap_weights_bh  = {f: float(shap_agg.get(f, 1.0 / max(len(bh_features), 1)))  for f in bh_features}
+    shap_weights_all = {f: float(shap_agg.get(f, 1.0 / max(len(all_features), 1))) for f in all_features}
 
     # OOS OHLCV data
     oos_mask = (

@@ -57,12 +57,12 @@ def make_fdr_table():
     lines.append(r"\midrule")
     for f in order:
         ra, rb = a.loc[f], b.loc[f]
-        ca = r"$\checkmark$" if bool(ra["rejected"]) else ""
-        cb = r"$\checkmark$" if bool(rb["rejected"]) else ""
+        ca = r"$\checkmark$" if bool(ra["bh_rejected"]) else ""
+        cb = r"$\checkmark$" if bool(rb["bh_rejected"]) else ""
         lines.append(
-            f"{tex_feat(f)} & {sig(ra['mean_ic'])} & {sig(ra['t_stat'],2)} & "
+            f"{tex_feat(f)} & {sig(ra['ic_bar'])} & {sig(ra['t_stat'],2)} & "
             f"{sig(ra['bh_adj_p'],3,False)} & {ca} & "
-            f"{sig(rb['mean_ic'])} & {sig(rb['t_stat'],2)} & "
+            f"{sig(rb['ic_bar'])} & {sig(rb['t_stat'],2)} & "
             f"{sig(rb['bh_adj_p'],3,False)} & {cb} \\\\"
         )
     lines.append(r"\bottomrule")

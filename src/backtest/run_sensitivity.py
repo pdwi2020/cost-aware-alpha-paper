@@ -106,6 +106,10 @@ def main():
         log(f"  Track: {track.upper()}")
         log(f"{'='*60}")
 
+        if not sig_path.exists():
+            log(f"  [SKIP] Signal file not found: {sig_path} (Track B has 0 BH features)")
+            continue
+
         signal_df = pd.read_parquet(sig_path)
         tickers   = signal_df.columns.tolist()
         returns, vol, adv_dollars_df, close_px = build_returns_vol_adv(

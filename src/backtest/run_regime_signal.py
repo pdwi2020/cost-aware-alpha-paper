@@ -294,21 +294,21 @@ def main():
         shap_avg = get_shap_avg(shap_df, track)
 
         # --- Static weights (pooled BH, from fdr_results.parquet) ---
-        static_feats = fdr_df[(fdr_df["track"] == track) & fdr_df["rejected"]]["feature"].tolist()
-        mean_ic_pooled = fdr_df[fdr_df["track"] == track].set_index("feature")["mean_ic"]
+        static_feats = fdr_df[(fdr_df["track"] == track) & fdr_df["bh_rejected"]]["feature"].tolist()
+        mean_ic_pooled = fdr_df[fdr_df["track"] == track].set_index("feature")["ic_bar"]
         weights_static = signed_shap_weights(static_feats, mean_ic_pooled, shap_avg)
         log(f"  Static features ({len(static_feats)}): {static_feats}")
 
         # --- Regime-specific weights (from fdr_regime.parquet) ---
         calm_feats = regime_df[
-            (regime_df["track"] == track) & (regime_df["regime"] == "calm") & regime_df["rejected"]
+            (regime_df["track"] == track) & (regime_df["regime"] == "calm") & regime_df["bh_rejected"]
         ]["feature"].tolist()
         stressed_feats = regime_df[
-            (regime_df["track"] == track) & (regime_df["regime"] == "stressed") & regime_df["rejected"]
+            (regime_df["track"] == track) & (regime_df["regime"] == "stressed") & regime_df["bh_rejected"]
         ]["feature"].tolist()
 
         mean_ic_regime = regime_df[regime_df["track"] == track].set_index(
-            ["feature", "regime"])["mean_ic"]
+            ["feature", "regime"])["ic_bar"]
 
         def _regime_ic(feats, reg):
             return pd.Series({
