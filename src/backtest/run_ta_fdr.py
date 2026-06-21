@@ -217,13 +217,19 @@ def _precompute_pnl_components(
         w = pd.DataFrame(arr, index=w.index, columns=w.columns)
 
     pos = w.shift(1).fillna(0.0)
-    common_dates   = pos.index.intersection(returns.index)
-    common_tickers = pos.columns.intersection(returns.columns)
+    # Align EVERY feature to a FIXED common (date x ticker) grid (the IS trading
+    # days present in `returns`), so the joint bootstrap's single shared date
+    # index applies identically across all features. A feature contributes zero
+    # position on dates/tickers where it has no signal. Without this, features
+    # have different T and the shared date index goes out of bounds.
+    grid_dates = returns.index[(returns.index >= pd.Timestamp(IS_START)) &
+                               (returns.index <= pd.Timestamp(IS_END))]
+    grid_tickers = returns.columns
 
-    pos_ = pos.loc[common_dates, common_tickers].values
-    ret_ = returns.loc[common_dates, common_tickers].fillna(0.0).values
-    sig_ = sigma.loc[common_dates, common_tickers].fillna(0.02).values
-    adv_ = adv.loc[common_dates, common_tickers].fillna(aum_dollars).values
+    pos_ = pos.reindex(index=grid_dates, columns=grid_tickers).fillna(0.0).values
+    ret_ = returns.reindex(index=grid_dates, columns=grid_tickers).fillna(0.0).values
+    sig_ = sigma.reindex(index=grid_dates, columns=grid_tickers).fillna(0.02).values
+    adv_ = adv.reindex(index=grid_dates, columns=grid_tickers).fillna(aum_dollars).values
 
     liquid = (adv_ >= min_adv_dollars).astype(float)
     pos_  *= liquid
@@ -443,7 +449,7 @@ def run_ta_fdr_track(
     if FDR_PATH.exists():
         bh_rej = pd.read_parquet(FDR_PATH)
         bh_rej_set = set(
-            bh_rej[(bh_rej["track"] == track) & bh_rej["rejected"]]["feature"].tolist()
+            bh_rej[(bh_rej["track"] == track) & bh_rej["bh_rejected"]]["feature"].tolist()
         )
 
     result_df = pd.DataFrame({
@@ -579,13 +585,17 @@ def run_oos_comparison(
                 shap_avg = shap_df[shap_df["track"] == track].groupby("feature")["mean_abs_shap"].mean()
                 w = {}
                 for f in ta_feats:
-                    sign = float(np.sign(bh_sub.loc[f, "mean_ic"])) if f in bh_sub.index else 1.0
+                    sign = float(np.sign(bh_sub.loc[f, "ic_bar"])) if f in bh_sub.index else 1.0
                     w[f] = sign * float(shap_avg.get(f, shap_avg.mean()))
                 ws = pd.Series(w)
                 ws = ws / ws.abs().sum()
                 sig = generate_composite_signal(feat_df, ws, HOLDOUT_START, HOLDOUT_END)
             else:
-                weights = build_signal_weights(track, fdr_df, shap_df)
+                try:
+                    weights = build_signal_weights(track, fdr_df, shap_df)
+                except ValueError:
+                    log(f"  [{track}] no BH-selected features — skipping OOS for static_bh")
+                    continue
                 sig = generate_composite_signal(feat_df, weights, HOLDOUT_START, HOLDOUT_END)
 
             tickers = sig.columns.tolist()
