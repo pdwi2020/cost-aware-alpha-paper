@@ -1,124 +1,285 @@
-"""Cost-aware alpha-investing comparator for TA-FDR.
+"""Online FDR via LORD++ applied to calibrated bootstrap p-values (fdr_results.parquet).
 
-Implements Foster & Stine (2008) alpha-investing with two reward variants:
-  - standard:    reward = alpha_0 per rejection (baseline)
-  - cost_aware:  reward = alpha_0 * normalized_net_IS_sharpe per rejection
+Primary procedure
+-----------------
+BH and BHY on calibrated block-bootstrap p-values (``boot_p`` column of
+``fdr_results.parquet``) are the PRIMARY multiple-testing procedures for this
+paper (see config/spec.yaml §fdr and R3 rewrite).  LORD++ is the ONLINE
+complement: it processes features in the pre-registered spec order (fixed in
+advance, not data-dependent) and provides a proven mFDR / FDR guarantee under
+arbitrary dependence.  Its output is reported as a supporting check; do NOT
+interpret LORD++ discoveries alone as the main confirmatory result.
 
-Features are ordered by descending |mean_IC| (IS IC magnitude).
-p-values are the permutation p-values from ta_fdr.parquet (same null as TA-FDR),
-ensuring the two procedures are directly comparable.
+LORD++ reference
+----------------
+Javanmard, A. & Montanari, A. (2018).
+  "Online Rules for Control of False Discovery Rate and False Discovery
+   Exceedance."  Annals of Statistics 46(2):526-554.
+  arXiv:1603.09000
 
-Payment function: uniform allocation alpha_j = W_{j-1} / (m - j + 1).
-This spreads remaining wealth evenly over remaining tests; the first test
-receives alpha_0 / m, matching the Bonferroni level.
+Ramdas, A., Yang, F., Wainwright, M. J., & Jordan, M. I. (2017).
+  "Online control of the false discovery rate with decaying memory."
+  NeurIPS 2017.  arXiv:1710.00499
 
-Output: data/processed/alpha_investing.parquet
+The LORD++ recursion used here follows Algorithm 2 of Javanmard & Montanari
+(2018).  With γ_j ∝ 1 / (j+1)^1.6 (normalised to sum to 1), the procedure
+controls the mFDR (marginal FDR) at level α under arbitrary dependence among
+the p-values, and controls FDR under independence.  The feature ordering is
+the pre-registered canonical order from feature_spec.KEPT_FEATURES +
+ADDED_INTERACTIONS, which is fixed before any data is seen.
+
+Outputs
+-------
+data/processed/online_fdr.parquet
+    Columns: track, feature, boot_p, lord_alpha_j, lord_rejected, order_idx
 """
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from src.features.feature_spec import KEPT_FEATURES, ADDED_INTERACTIONS
+import src.manifest as manifest
+
 DATA = ROOT / "data" / "processed"
+OUT  = DATA / "online_fdr.parquet"
+
+# Pre-registered feature order (spec-fixed; must not be changed after registration).
+_PREREGISTERED_ORDER: list[str] = KEPT_FEATURES + ADDED_INTERACTIONS
 
 
-def alpha_investing(
-    features_df: pd.DataFrame,
-    alpha_0: float = 0.10,
-    mode: str = "standard",
-) -> pd.DataFrame:
-    """Run alpha-investing on features ordered by descending |mean_ic|.
+# ---------------------------------------------------------------------------
+# LORD++ implementation
+# ---------------------------------------------------------------------------
 
-    Args:
-        features_df: DataFrame with columns [feature, p_perm, T_obs, mean_ic].
-                     Must already be sorted by descending |mean_ic|.
-        alpha_0:     Initial wealth (= FDR target q = 0.10).
-        mode:        'standard' or 'cost_aware'.
+def _gamma_sequence(m: int, exponent: float = 1.6) -> np.ndarray:
+    """Normalised γ weights: γ_j ∝ 1/(j+1)^exponent, summing to 1.
 
-    Returns:
-        DataFrame with per-feature results including wealth trace.
+    j is 0-indexed here; in the paper it is 1-indexed.  The sum is over
+    j = 0 .. m-1, i.e. the first m terms.  We normalise to make the weights
+    proper even for finite m; for large m the tail is negligible.
     """
-    m = len(features_df)
-    W = alpha_0
+    j = np.arange(1, m + 1, dtype=float)   # 1-indexed j = 1..m
+    w = 1.0 / (j ** exponent)
+    return w / w.sum()
 
-    # Cost-aware normalisation: map T_obs to [0, 1] (0 = worst, 1 = best)
-    T = features_df["T_obs"].values
-    T_shifted = T - T.min()
-    T_norm = T_shifted / T_shifted.max() if T_shifted.max() > 0 else np.ones(m) * 0.5
 
-    rows = []
-    for j, (_, row) in enumerate(features_df.iterrows()):
-        remaining = m - j
-        alpha_j = W / remaining  # uniform allocation
-        alpha_j = min(alpha_j, W)  # cannot spend more than available
+def lord_plus_plus(
+    p_values: Sequence[float],
+    alpha: float = 0.10,
+    gamma: Sequence[float] | None = None,
+) -> list[bool]:
+    """LORD++ online FDR procedure (Javanmard & Montanari 2018, Alg. 2).
 
-        W_before = W
-        W -= alpha_j
+    Features are tested in the order they appear in ``p_values``.  The order
+    must be pre-specified and data-independent (e.g. the canonical pre-
+    registered feature order from feature_spec).
 
-        if row["p_perm"] <= alpha_j:
-            rejected = True
-            if mode == "cost_aware":
-                reward = alpha_0 * float(T_norm[j])
-            else:
-                reward = alpha_0
-            W += reward
+    Parameters
+    ----------
+    p_values:
+        Ordered sequence of p-values to test.
+    alpha:
+        FDR target level (e.g. 0.10).
+    gamma:
+        Wealth-allocation sequence γ_1, …, γ_m (1-indexed).  Must be
+        non-negative and sum to ≤ 1.  If None, uses 1/(j+1)^1.6 normalised.
+
+    Returns
+    -------
+    list[bool]
+        ``rejected[j]`` is True iff hypothesis j is rejected (0-indexed).
+
+    Notes
+    -----
+    LORD++ (Algorithm 2, Javanmard & Montanari 2018) maintains an alpha-
+    wealth W_t and allocates spending level α_t = γ_{t - τ_l} * W_{τ_l^-}
+    where τ_l is the time of the l-th rejection and W_{τ_l^-} is the wealth
+    just before that rejection.  The initial wealth is W_0 = α * γ_1.
+
+    For practical implementation with a fixed-length sequence we compute
+    α_j using the recursive form:
+        W_0  = α * γ_1
+        For each step j (1-indexed):
+            α_j  = γ_{j - τ_{R(j)}} * W_{τ_{R(j)}^-}
+            if p_j <= α_j: reject; W_j = W_{j-1} + α * γ_{j - τ_{R(j)} + 1}
+            else:          do not reject; W_j = W_{j-1} - α_j
+
+    where R(j) is the number of rejections up to j-1, and τ_{R(j)} is the
+    time of the last rejection before j (or 0 if none).
+    """
+    p = list(p_values)
+    m = len(p)
+    if m == 0:
+        return []
+
+    if gamma is None:
+        gam = _gamma_sequence(m + 1)   # need up to index m (1-indexed)
+    else:
+        gam = np.asarray(gamma, dtype=float)
+
+    # W_0 = alpha * gamma_1  (LORD++ initial wealth)
+    W = float(alpha * gam[0])
+
+    rejected: list[bool] = []
+    # Track wealth snapshots at each rejection time
+    # tau_last = time of last rejection (1-indexed; 0 if none)
+    # W_before_last = wealth just before last rejection
+    tau_last: int = 0
+    W_before_last: float = W   # W_0
+
+    for j in range(1, m + 1):   # 1-indexed
+        # Distance from last rejection event
+        delta = j - tau_last
+
+        if delta - 1 < len(gam):
+            alpha_j = float(gam[delta - 1] * W_before_last)
         else:
-            rejected = False
-            reward = 0.0
+            alpha_j = 0.0   # gamma exhausted; effectively no budget
 
-        rows.append(
-            {
-                "feature": row["feature"],
-                "mean_ic": row["mean_ic"],
-                "T_obs": row["T_obs"],
-                "p_perm": row["p_perm"],
-                "alpha_j": round(alpha_j, 6),
-                "wealth_before": round(W_before, 6),
-                "wealth_after": round(W, 6),
-                "reward": round(reward, 6),
-                "ai_rejected": rejected,
-                "mode": mode,
-            }
-        )
+        # Cannot spend more than current wealth (safeguard against rounding)
+        alpha_j = min(alpha_j, W)
+        alpha_j = max(alpha_j, 0.0)
 
-    return pd.DataFrame(rows)
+        pj = float(p[j - 1])
+        if pj <= alpha_j:
+            rejected.append(True)
+            # Wealth increases by alpha * gamma_{delta+1}
+            bonus_idx = delta   # gamma[delta] = gamma_{delta+1} (0-indexed)
+            bonus = float(alpha * gam[bonus_idx]) if bonus_idx < len(gam) else 0.0
+            W_before_last = W   # capture wealth just BEFORE this rejection
+            tau_last = j
+            W = W - alpha_j + bonus
+        else:
+            rejected.append(False)
+            W = W - alpha_j
+
+        W = max(W, 0.0)   # wealth cannot go negative (numerical safeguard)
+
+    return rejected
+
+
+# ---------------------------------------------------------------------------
+# Pipeline entry point
+# ---------------------------------------------------------------------------
+
+def _preregistered_order_for(features: list[str]) -> list[str]:
+    """Return the pre-registered order restricted to features actually present."""
+    present = set(features)
+    ordered = [f for f in _PREREGISTERED_ORDER if f in present]
+    # Append any features not in the pre-registered list last (alphabetical)
+    extras = sorted(present - set(ordered))
+    return ordered + extras
 
 
 def main() -> None:
-    ta_fdr = pd.read_parquet(DATA / "ta_fdr.parquet")
+    print(
+        "=== LORD++ Online FDR (calibrated bootstrap p-values) ===\n"
+        "NOTE: BH/BHY on boot_p (fdr_results.parquet) is the PRIMARY procedure.\n"
+        "      LORD++ is the online complement with a proven mFDR/FDR guarantee.\n"
+    )
+
     fdr = pd.read_parquet(DATA / "fdr_results.parquet")
 
-    results = []
-    for track in ["track_b", "track_a"]:
-        ta = ta_fdr[ta_fdr.track == track][["feature", "T_obs", "p_perm"]].copy()
-        ic = fdr[fdr.track == track][["feature", "mean_ic"]].copy()
-        merged = ta.merge(ic, on="feature")
+    # Validate required columns
+    required = {"track", "feature", "boot_p"}
+    missing = required - set(fdr.columns)
+    if missing:
+        raise ValueError(
+            f"fdr_results.parquet is missing columns: {missing}. "
+            "Run the R3 FDR pipeline first."
+        )
 
-        # Order by descending |mean_ic| (IS IC magnitude)
-        merged = merged.assign(abs_ic=merged["mean_ic"].abs())
-        merged = merged.sort_values("abs_ic", ascending=False).drop(columns="abs_ic")
-        merged = merged.reset_index(drop=True)
+    all_results: list[pd.DataFrame] = []
 
-        for mode in ("standard", "cost_aware"):
-            df = alpha_investing(merged, alpha_0=0.10, mode=mode)
-            df.insert(0, "track", track)
-            results.append(df)
+    for track in sorted(fdr["track"].unique()):
+        sub = fdr[fdr["track"] == track].copy()
+        features = sub["feature"].tolist()
 
-    out = pd.concat(results, ignore_index=True)
-    out.to_parquet(DATA / "alpha_investing.parquet", index=False)
+        # Sort into pre-registered canonical order (data-independent)
+        ordered_features = _preregistered_order_for(features)
+        order_map = {f: i for i, f in enumerate(ordered_features)}
+        sub = sub.copy()
+        sub["order_idx"] = sub["feature"].map(order_map)
+        sub = sub.sort_values("order_idx").reset_index(drop=True)
 
-    # Summary
-    for track in ["track_b", "track_a"]:
-        for mode in ("standard", "cost_aware"):
-            sub = out[(out.track == track) & (out["mode"] == mode)]
-            n_rej = sub["ai_rejected"].sum()
-            alpha_min = sub["alpha_j"].min()
-            p_min = sub["p_perm"].min()
-            print(
-                f"{track} | {mode:12s} | rejections={n_rej}/35 "
-                f"| min_alpha_j={alpha_min:.5f} | min_p_perm={p_min:.4f}"
-            )
+        p_vals = sub["boot_p"].tolist()
+        rejected_flags = lord_plus_plus(p_vals, alpha=0.10)
+
+        sub["lord_alpha_j"] = _compute_alpha_sequence(p_vals, alpha=0.10)
+        sub["lord_rejected"] = rejected_flags
+        sub["track"] = track
+
+        n_selected = int(sum(rejected_flags))
+        print(
+            f"  {track}: {n_selected}/{len(features)} selected by LORD++ "
+            f"(vs BH primary: {int(sub['bh_rejected'].sum()) if 'bh_rejected' in sub.columns else '?'})"
+        )
+
+        # Record to manifest
+        manifest.record(
+            key=f"online_fdr.{track}.n_selected",
+            value=n_selected,
+            stage="online_fdr",
+            track=track,
+            meta={"procedure": "LORD++", "alpha": 0.10, "order": "pre_registered_feature_spec"},
+        )
+
+        all_results.append(sub[["track", "feature", "order_idx", "boot_p",
+                                 "lord_alpha_j", "lord_rejected"]])
+
+    out = pd.concat(all_results, ignore_index=True)
+    out.to_parquet(OUT, index=False)
+    print(f"\nSaved → {OUT}")
+    print(
+        "\nReminder: LORD++ discoveries are a supporting online-FDR check.\n"
+        "The PRIMARY inference is BH/BHY on calibrated bootstrap p-values.\n"
+        "Do not overclaim LORD++ as a standalone confirmatory result."
+    )
+
+
+def _compute_alpha_sequence(p_values: list[float], alpha: float = 0.10) -> list[float]:
+    """Return the per-step spending levels α_j used by LORD++ (for logging/output)."""
+    m = len(p_values)
+    if m == 0:
+        return []
+
+    gam = _gamma_sequence(m + 1)
+    W = float(alpha * gam[0])
+    tau_last = 0
+    W_before_last = W
+
+    alphas: list[float] = []
+    for j in range(1, m + 1):
+        delta = j - tau_last
+        if delta - 1 < len(gam):
+            alpha_j = float(gam[delta - 1] * W_before_last)
+        else:
+            alpha_j = 0.0
+        alpha_j = min(alpha_j, W)
+        alpha_j = max(alpha_j, 0.0)
+        alphas.append(alpha_j)
+
+        pj = float(p_values[j - 1])
+        if pj <= alpha_j:
+            bonus_idx = delta
+            bonus = float(alpha * gam[bonus_idx]) if bonus_idx < len(gam) else 0.0
+            W_before_last = W
+            tau_last = j
+            W = W - alpha_j + bonus
+        else:
+            W = W - alpha_j
+        W = max(W, 0.0)
+
+    return alphas
 
 
 if __name__ == "__main__":

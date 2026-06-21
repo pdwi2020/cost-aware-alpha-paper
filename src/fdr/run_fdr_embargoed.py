@@ -99,14 +99,14 @@ def run_bh_embargoed(ic_df: pd.DataFrame, track: str) -> pd.DataFrame:
     mean_ic, t_stats, p_values = compute_ic_tstats(ic_df.drop(columns="n_test", errors="ignore"))
     reject, adj_p = benjamini_hochberg(p_values.values, q=FDR_Q)
     return pd.DataFrame({
-        "track":    track,
-        "feature":  ic_df.drop(columns="n_test", errors="ignore").columns.tolist(),
-        "mean_ic":  mean_ic.values,
-        "t_stat":   t_stats.values,
-        "p_value":  p_values.values,
-        "bh_adj_p": adj_p,
-        "rejected": reject,
-    }).sort_values(["rejected", "p_value"], ascending=[False, True])
+        "track":       track,
+        "feature":     ic_df.drop(columns="n_test", errors="ignore").columns.tolist(),
+        "ic_bar":      mean_ic.values,
+        "t_stat":      t_stats.values,
+        "boot_p":      p_values.values,
+        "bh_adj_p":    adj_p,
+        "bh_rejected": reject,
+    }).sort_values(["bh_rejected", "boot_p"], ascending=[False, True])
 
 
 def main():
@@ -141,13 +141,13 @@ def main():
 
         ic_df    = compute_fold_ics_embargoed(df, features, target_col, fold_dates)
         result   = run_bh_embargoed(ic_df, track)
-        n_rej    = result["rejected"].sum()
+        n_rej    = result["bh_rejected"].sum()
         log(f"\n  BH rejected (embargoed, FDR q={FDR_Q}): {n_rej}/{len(features)}")
-        rej_feats = result[result["rejected"]]["feature"].tolist()
+        rej_feats = result[result["bh_rejected"]]["feature"].tolist()
         log(f"  Rejected: {rej_feats}")
 
         # Compare to baseline
-        base_rej = set(baseline_df[(baseline_df["track"] == track) & baseline_df["rejected"]]["feature"])
+        base_rej = set(baseline_df[(baseline_df["track"] == track) & baseline_df["bh_rejected"]]["feature"])
         emb_rej  = set(rej_feats)
         added    = sorted(emb_rej - base_rej)
         removed  = sorted(base_rej - emb_rej)

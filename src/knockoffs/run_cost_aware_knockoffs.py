@@ -716,7 +716,7 @@ def main():
 
     # Also get BH-on-IC set for rigor-ladder comparison
     bh_df = pd.read_parquet(FDR_PATH)
-    bh_set = set(bh_df[(bh_df["track"] == args.track) & bh_df["rejected"]]["feature"])
+    bh_set = set(bh_df[(bh_df["track"] == args.track) & bh_df["bh_rejected"]]["feature"])
     importance_df["bh_on_ic"] = importance_df["feature"].isin(bh_set)
 
     cak_set = set(importance_df[importance_df["cak_selected"]]["feature"])
