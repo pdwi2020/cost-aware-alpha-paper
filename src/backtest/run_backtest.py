@@ -31,10 +31,11 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
 
 SIG_A_PATH  = ROOT / "data" / "processed" / "signals_track_a.parquet"
 SIG_B_PATH  = ROOT / "data" / "processed" / "signals_track_b.parquet"
+FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
 OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
@@ -53,17 +54,10 @@ def log(msg): print(msg, flush=True)
 
 SANITIZE_CAP = 0.50   # ±50% return cap, mirrors build_features.py and run_baselines.py
 
-# Screen 0 — tradeable-universe filter (matches run_holdout.py verbatim)
-MIN_PRICE = 5.0
-
-
-def apply_min_price_filter(positions, close_w, min_price=MIN_PRICE):
-    """Screen 0: zero positions in names priced < min_price on the trade date,
-    then renormalise gross (L1) leverage to 1 per day."""
-    pxa = close_w.reindex(index=positions.index, columns=positions.columns).ffill()
-    positions = positions.where(pxa >= min_price, 0.0)
-    l1 = positions.abs().sum(axis=1).replace(0, np.nan)
-    return positions.div(l1, axis=0).fillna(0.0)
+# Screen 0 (look-ahead-free) — see src/data/screen0.py and portfolio.apply_s0_eligible.
+# apply_min_price_filter (which used trade-date close to gate that same day's return)
+# has been removed.  Eligibility is now determined from s0_eligible in features_all.parquet,
+# which is computed from price[t-1] and trailing ADV[t-window:t-1] (no look-ahead).
 
 
 def _clip_returns(ret_df: pd.DataFrame, cap: float) -> pd.DataFrame:
@@ -130,7 +124,7 @@ def run_single_backtest(
     track: str,
     aum_dollars: float = 1e8,
     min_adv_dollars: float = 1e6,
-    close_w: pd.DataFrame | None = None,
+    feat_df: pd.DataFrame | None = None,
 ) -> dict:
     """Run one scenario: build positions, simulate P&L, compute metrics."""
     sim = PortfolioSimulator(
@@ -139,9 +133,9 @@ def run_single_backtest(
         impact_coeff=impact_coeff,
     )
     positions = sim.signal_to_positions(signal_df, lag=1)
-    # Screen 0: exclude penny stocks (price < $5) on trade date
-    if close_w is not None:
-        positions = apply_min_price_filter(positions, close_w)
+    # Screen 0 (look-ahead-free) — see src/data/screen0.py
+    if feat_df is not None:
+        positions = apply_s0_eligible(positions, feat_df)
     pnl_df    = sim.simulate_pnl(positions, returns, vol=vol,
                                   adv_dollars=adv_dollars, aum_dollars=aum_dollars,
                                   min_adv_dollars=min_adv_dollars)
@@ -155,6 +149,7 @@ def run_single_backtest(
         **metrics,
         "_pnl_df":      pnl_df,   # keep for base-case printout (stripped before saving)
     }
+
 
 
 def print_metrics(metrics: dict, label: str) -> None:
@@ -187,6 +182,9 @@ def main():
     log("Loading OHLCV …")
     ohlcv = pd.read_parquet(OHLCV_PATH)
 
+    log("Loading features_all.parquet (for look-ahead-free Screen 0) …")
+    feat_df = pd.read_parquet(FEAT_PATH)
+
     base_results = []
     sens_rows    = []
 
@@ -195,6 +193,10 @@ def main():
         log(f"  Track: {track.upper()}")
         log(f"{'='*60}")
 
+        if not sig_path.exists():
+            log(f"  [SKIP] no signal file for {track} "
+                f"(no deployable strategy under the corrected FDR). Skipping.")
+            continue
         signal_df = pd.read_parquet(sig_path)
         log(f"  Signal: {signal_df.shape[0]} dates × {signal_df.shape[1]} tickers")
 
@@ -210,7 +212,7 @@ def main():
             signal_df, returns, vol, adv_dollars,
             spread_bps=base_spread, impact_coeff=base_impact,
             cfg_path=CFG_PATH, track=track, aum_dollars=aum_dollars,
-            close_w=close_px,
+            feat_df=feat_df,
         )
         print_metrics(base, f"Base case — {track.upper()}")
         base_results.append({k: v for k, v in base.items() if k != "_pnl_df"})
@@ -222,7 +224,7 @@ def main():
                 signal_df, returns, vol, adv_dollars,
                 spread_bps=sp, impact_coeff=ic,
                 cfg_path=CFG_PATH, track=track, aum_dollars=aum_dollars,
-                close_w=close_px,
+                feat_df=feat_df,
             )
             sens_rows.append({k: v for k, v in res.items() if k != "_pnl_df"})
 

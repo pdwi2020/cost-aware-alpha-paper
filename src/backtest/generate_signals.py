@@ -46,7 +46,7 @@ def build_signal_weights(track: str, fdr_df: pd.DataFrame, shap_df: pd.DataFrame
 
     Weight_f = sign(mean_IC_f) × avg_SHAP_f, then L1-normalised.
     """
-    rejected = fdr_df[(fdr_df["track"] == track) & fdr_df["rejected"]].set_index("feature")
+    rejected = fdr_df[(fdr_df["track"] == track) & fdr_df["bh_rejected"]].set_index("feature")
     if rejected.empty:
         raise ValueError(f"No BH-rejected features for {track}")
 
@@ -59,7 +59,7 @@ def build_signal_weights(track: str, fdr_df: pd.DataFrame, shap_df: pd.DataFrame
 
     weights = {}
     for feat in rejected.index:
-        sign = np.sign(rejected.loc[feat, "mean_ic"])
+        sign = np.sign(rejected.loc[feat, "ic_bar"])
         shap_w = float(shap_avg.get(feat, 0.0))
         weights[feat] = sign * shap_w
 
@@ -139,8 +139,12 @@ def main():
         log(f"  Building signal: {track.upper()}")
         log(f"{'='*55}")
 
-        weights = build_signal_weights(track, fdr_df, shap_df)
-        n_sig = (fdr_df[(fdr_df.track == track) & fdr_df.rejected]).shape[0]
+        try:
+            weights = build_signal_weights(track, fdr_df, shap_df)
+        except ValueError as e:
+            log(f"  [SKIP] {e} — no deployable {track} strategy under the corrected FDR.")
+            continue
+        n_sig = (fdr_df[(fdr_df.track == track) & fdr_df.bh_rejected]).shape[0]
         log(f"  BH-significant features: {n_sig}")
         log(f"  Features in signal:")
         for f, w in weights.sort_values(key=abs, ascending=False).items():

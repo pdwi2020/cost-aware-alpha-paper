@@ -26,6 +26,53 @@ from src.backtest.almgren_chriss import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Screen 0 (look-ahead-free) helper — see src/data/screen0.py
+# ---------------------------------------------------------------------------
+
+def apply_s0_eligible(positions: pd.DataFrame, feat_df: pd.DataFrame) -> pd.DataFrame:
+    """Apply look-ahead-free Screen 0 using the pre-computed s0_eligible flag.
+
+    Screen 0 (look-ahead-free) — see src/data/screen0.py
+    s0_eligible at date t is derived from price[t-1], trailing ADV[t-window:t-1],
+    and PIT index membership — all known before the open at t.  No trade-date
+    price is used, so there is zero look-ahead.
+
+    Parameters
+    ----------
+    positions : date × ticker DataFrame of position weights (pre-renorm)
+    feat_df   : MultiIndex (ticker, date) or (date, ticker) features DataFrame
+                that contains an 's0_eligible' boolean column
+
+    Returns
+    -------
+    positions : same shape, with ineligible names zeroed and L1 gross
+                renormalised among the ELIGIBLE names (deployed capital unchanged).
+                If 's0_eligible' is absent from feat_df, returns positions unchanged
+                with a warning (so scripts degrade gracefully).
+    """
+    if "s0_eligible" not in feat_df.columns:
+        import warnings
+        warnings.warn(
+            "[Screen0] s0_eligible column not found in features parquet; "
+            "rebuild with build_features.py to enable look-ahead-free Screen 0. "
+            "Proceeding WITHOUT Screen 0 filter.",
+            stacklevel=2,
+        )
+        return positions
+
+    elig_col = feat_df["s0_eligible"]
+    # feat_df may already have a MultiIndex; unstack ticker → date×ticker boolean matrix
+    elig_wide = elig_col.unstack(level="ticker")   # date × ticker
+    elig_wide = elig_wide.reindex(index=positions.index, columns=positions.columns)
+    elig_wide = elig_wide.fillna(False).astype(bool)
+
+    positions = positions.where(elig_wide, 0.0)
+    # Renormalise L1 gross among eligible names so capital stays deployed
+    l1 = positions.abs().sum(axis=1).replace(0.0, np.nan)
+    return positions.div(l1, axis=0).fillna(0.0)
+
+
 class PortfolioSimulator:
     """Simulate strategy P&L with Almgren-Chriss execution costs."""
 

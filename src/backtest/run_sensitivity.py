@@ -31,11 +31,12 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
-from src.backtest.run_backtest import build_returns_vol_adv, apply_min_price_filter
+from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
+from src.backtest.run_backtest import build_returns_vol_adv
 
 SIG_A_PATH = ROOT / "data" / "processed" / "signals_track_a.parquet"
 SIG_B_PATH = ROOT / "data" / "processed" / "signals_track_b.parquet"
+FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
 OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 
@@ -55,7 +56,7 @@ def run_scenario(
     signal_df, returns, vol, adv_dollars,
     spread_bps, impact_coeff, rebal_freq,
     aum_dollars, track, min_adv_dollars=1e6,
-    close_w=None,
+    feat_df=None,
 ) -> dict:
     sim = PortfolioSimulator(
         config_path=str(CFG_PATH),
@@ -63,9 +64,9 @@ def run_scenario(
         impact_coeff=impact_coeff,
     )
     positions = sim.signal_to_positions(signal_df, lag=1, rebal_freq=rebal_freq)
-    # Screen 0: exclude penny stocks (price < $5) on trade date
-    if close_w is not None:
-        positions = apply_min_price_filter(positions, close_w)
+    # Screen 0 (look-ahead-free) — see src/data/screen0.py
+    if feat_df is not None:
+        positions = apply_s0_eligible(positions, feat_df)
     pnl_df    = sim.simulate_pnl(positions, returns, vol=vol,
                                   adv_dollars=adv_dollars, aum_dollars=aum_dollars,
                                   min_adv_dollars=min_adv_dollars)
@@ -95,6 +96,9 @@ def main():
     log("Loading OHLCV …")
     ohlcv = pd.read_parquet(OHLCV_PATH)
 
+    log("Loading features_all.parquet (for look-ahead-free Screen 0) …")
+    feat_df = pd.read_parquet(FEAT_PATH)
+
     all_rows = []
 
     for track, sig_path in [("track_a", SIG_A_PATH), ("track_b", SIG_B_PATH)]:
@@ -117,7 +121,7 @@ def main():
                     signal_df, returns, vol, adv_dollars_df,
                     sp, ic, rebal_freq, aum_dollars, track,
                     min_adv_dollars=min_adv_dollars,
-                    close_w=close_px,
+                    feat_df=feat_df,
                 )
                 all_rows.append(row)
 

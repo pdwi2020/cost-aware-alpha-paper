@@ -18,7 +18,7 @@ Methodology:
     min_samples_leaf ∈ {50,100}, n_estimators=200 final; same as model_suite)
   - XGB hyperparams: grid-searched per fold (max_depth ∈ {3,4,5},
     eta ∈ {0.01,0.05}, same subsample/colsample_bytree as model_suite)
-  - Screen 0: price ≥ $5 filter (apply_min_price_filter) + $1M ADV floor
+  - Screen 0: look-ahead-free (s0_eligible from features_all.parquet) + $1M ADV floor
   - Cost model: spread=3bps, impact_coeff=0.10, AUM=$100M (from backtest.yaml)
   - Rebalancing: 5-day weekly (REBAL_FREQ=5, same as run_holdout.py)
 
@@ -50,12 +50,10 @@ from src.models.model_suite import (
     preprocess,
 )
 from src.features.feature_spec import feature_columns as _feature_columns
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
 from src.backtest.run_holdout import (
-    apply_min_price_filter,
     build_returns_vol_adv_holdout,
     SANITIZE_CAP,
-    MIN_PRICE,
     REBAL_FREQ,
     VOL_WINDOW,
 )
@@ -304,7 +302,7 @@ def predictions_to_signal(preds, index):
 # Backtest one window
 # ---------------------------------------------------------------------------
 
-def run_backtest_window(signal_wide, ohlcv, start, end, cfg, label):
+def run_backtest_window(signal_wide, ohlcv, feat_df, start, end, cfg, label):
     """Run full backtest for a given signal panel and window."""
     tickers = signal_wide.columns.tolist()
     returns, vol, adv_dollars, close_px = build_returns_vol_adv_holdout(
@@ -319,11 +317,11 @@ def run_backtest_window(signal_wide, ohlcv, start, end, cfg, label):
 
     positions = sim.signal_to_positions(signal_wide, lag=1, rebal_freq=REBAL_FREQ)
 
-    # Screen 0: price ≥ $5
+    # Screen 0 (look-ahead-free) — see src/data/screen0.py
     n_before = int((positions.abs() > 1e-12).sum().sum())
-    positions = apply_min_price_filter(positions, close_px, MIN_PRICE)
+    positions = apply_s0_eligible(positions, feat_df)
     n_after = int((positions.abs() > 1e-12).sum().sum())
-    log(f"  [{label}] Screen 0 (price≥${MIN_PRICE:.0f}): {n_before} → {n_after} active positions")
+    log(f"  [{label}] Screen 0 (lagged price≥$5, ADV≥$1M, PIT member): {n_before} → {n_after} active positions")
 
     min_adv = cfg.get("min_adv_dollars", 1e6)
     pnl_df  = sim.simulate_pnl(
@@ -469,7 +467,7 @@ def main():
     log("=" * 65)
 
     is_metrics, is_pnl = run_backtest_window(
-        is_signal, ohlcv, IS_START, IS_END, cfg, "IS"
+        is_signal, ohlcv, feat_df, IS_START, IS_END, cfg, "IS"
     )
 
     log(f"\n  IS Results (2013–2021):")
@@ -488,7 +486,7 @@ def main():
     log("=" * 65)
 
     oos_metrics, oos_pnl = run_backtest_window(
-        oos_signal, ohlcv, OOS_START, OOS_END, cfg, "OOS"
+        oos_signal, ohlcv, feat_df, OOS_START, OOS_END, cfg, "OOS"
     )
 
     log(f"\n  OOS Results (2022–2024):")

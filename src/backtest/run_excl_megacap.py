@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
 from src.backtest.generate_signals import build_signal_weights, generate_composite_signal
 
 FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
@@ -52,21 +52,12 @@ REBAL_FREQ    = 5
 VOL_WINDOW    = 21
 N_MEGA        = 25     # number of largest tickers to exclude
 
-# Screen 0 — tradeable-universe filter (matches run_holdout.py verbatim)
-MIN_PRICE    = 5.0
+# Screen 0 (look-ahead-free) — see src/data/screen0.py and portfolio.apply_s0_eligible.
+# MIN_PRICE removed: apply_min_price_filter (which used trade-date close) was look-ahead.
 SANITIZE_CAP = 0.50
 
 
 def log(msg): print(msg, flush=True)
-
-
-def apply_min_price_filter(positions, close_w, min_price=MIN_PRICE):
-    """Screen 0: zero positions in names priced < min_price on the trade date,
-    then renormalise gross (L1) leverage to 1 per day."""
-    pxa = close_w.reindex(index=positions.index, columns=positions.columns).ffill()
-    positions = positions.where(pxa >= min_price, 0.0)
-    l1 = positions.abs().sum(axis=1).replace(0, np.nan)
-    return positions.div(l1, axis=0).fillna(0.0)
 
 
 def identify_megacap_tickers(ohlcv: pd.DataFrame, n: int = N_MEGA) -> list:
@@ -183,11 +174,11 @@ def main():
         returns, vol, adv, close_px = build_returns_vol_adv(ohlcv_excl, tickers, HOLDOUT_START, HOLDOUT_END)
 
         positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
-        # Screen 0: exclude penny stocks (price < $5) on trade date
+        # Screen 0 (look-ahead-free) — see src/data/screen0.py
         n_before = int((positions.abs() > 1e-12).sum().sum())
-        positions = apply_min_price_filter(positions, close_px)
+        positions = apply_s0_eligible(positions, feat_df_excl)
         n_after = int((positions.abs() > 1e-12).sum().sum())
-        log(f"  Screen 0 (price≥${MIN_PRICE:.0f}): {n_before}→{n_after} active positions")
+        log(f"  Screen 0 (lagged price≥$5, ADV≥$1M, PIT member): {n_before}→{n_after} active positions")
         pnl_df    = sim.simulate_pnl(
             positions, returns, vol=vol,
             adv_dollars=adv,

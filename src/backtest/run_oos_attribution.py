@@ -46,7 +46,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
 from src.features.feature_spec import feature_columns as _feature_columns
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -64,8 +64,8 @@ VOL_WINDOW = 21
 TRACK      = "track_b"
 ANN        = 252.0
 
-# Screen 0 — tradeable-universe filter (matches run_holdout.py verbatim)
-MIN_PRICE    = 5.0
+# Screen 0 (look-ahead-free) — see src/data/screen0.py and portfolio.apply_s0_eligible.
+# MIN_PRICE removed: apply_min_price_filter (which used trade-date close) was look-ahead.
 SANITIZE_CAP = 0.50
 
 # ── feature group templates (pattern-based; matched against actual BH features) ──
@@ -96,15 +96,6 @@ def log(msg):
     print(msg, flush=True)
 
 
-def apply_min_price_filter(positions, close_w, min_price=MIN_PRICE):
-    """Screen 0: zero positions in names priced < min_price on the trade date,
-    then renormalise gross (L1) leverage to 1 per day."""
-    pxa = close_w.reindex(index=positions.index, columns=positions.columns).ffill()
-    positions = positions.where(pxa >= min_price, 0.0)
-    l1 = positions.abs().sum(axis=1).replace(0, np.nan)
-    return positions.div(l1, axis=0).fillna(0.0)
-
-
 def sharpe_ann(r: np.ndarray) -> float:
     sd = r.std(ddof=1)
     return float(r.mean() / sd * np.sqrt(ANN)) if sd > 1e-12 else np.nan
@@ -114,7 +105,7 @@ def run_variant(label: str, mode: str, feat_subset: list, oos_feat: pd.DataFrame
                 shap_weights: dict, fdr_sign: dict, sim: PortfolioSimulator,
                 returns: pd.DataFrame, vol: pd.DataFrame, adv: pd.DataFrame,
                 aum: float, min_adv: float,
-                close_w: pd.DataFrame | None = None) -> dict | None:
+                screen0_feat: pd.DataFrame | None = None) -> dict | None:
     available = [f for f in feat_subset if f in oos_feat.columns]
     if not available:
         log(f"  SKIP {label}: no available features")
@@ -143,9 +134,9 @@ def run_variant(label: str, mode: str, feat_subset: list, oos_feat: pd.DataFrame
         return None
 
     positions = sim.signal_to_positions(sig_wide[common_t], lag=1, rebal_freq=REBAL_FREQ)
-    # Screen 0: exclude penny stocks (price < $5) on trade date
-    if close_w is not None:
-        positions = apply_min_price_filter(positions, close_w[common_t])
+    # Screen 0 (look-ahead-free) — see src/data/screen0.py
+    if screen0_feat is not None:
+        positions = apply_s0_eligible(positions, screen0_feat)
     pnl = sim.simulate_pnl(
         positions,
         returns[common_t].clip(lower=-SANITIZE_CAP, upper=SANITIZE_CAP),
@@ -265,7 +256,7 @@ def main():
         log(f"  {gname} ({len(feats)} features)")
         res = run_variant(gname, "A_standalone", feats, oos_feat,
                           shap_weights, fdr_sign, sim, returns, vol, adv, aum, min_adv,
-                          close_w=close_w)
+                          screen0_feat=oos_feat)
         if res:
             if gname == "Full":
                 full_net_sr = res["net_sr"]
@@ -281,7 +272,7 @@ def main():
         log(f"  {gname} complement ({len(complement)} features)")
         res = run_variant(label_logo, "B_logo", complement, oos_feat,
                           shap_weights, fdr_sign, sim, returns, vol, adv, aum, min_adv,
-                          close_w=close_w)
+                          screen0_feat=oos_feat)
         if res and full_net_sr is not None:
             marginal = round(full_net_sr - res["net_sr"], 3)
             res["logo_marginal_sr"] = marginal
