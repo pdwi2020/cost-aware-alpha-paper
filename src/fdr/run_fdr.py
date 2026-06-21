@@ -42,7 +42,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.models.model_suite import make_fold_dates
 from src.fdr.bh_correction import benjamini_hochberg, bhy_procedure
-from src.universe_paths import proc
+from src.universe_paths import proc, universe_suffix
 from src.features.feature_spec import feature_columns as _feature_columns
 import src.manifest as manifest
 
@@ -389,6 +389,12 @@ def main():
     log("=== Phase-3 FDR: Daily Cross-Sectional IC + Stationary Bootstrap ===\n")
     t0 = time.time()
 
+    # Namespace manifest keys by universe so a cross-universe run (e.g.
+    # CAVAL_UNIVERSE=r2000) cannot clobber the S&P primary entries.
+    # S&P (no suffix) -> "fdr"; Russell 2000 -> "fdr_r2000".
+    fdr_ns = f"fdr{universe_suffix()}"
+    log(f"  manifest namespace: {fdr_ns}")
+
     df = pd.read_parquet(FEATURES_PATH)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
@@ -449,22 +455,22 @@ def main():
         short_track  = track.split("_")[1].upper()   # "A" or "B"
 
         manifest.record(
-            f"fdr.{track}.n_selected_bh", n_bh_rej,
+            f"{fdr_ns}.{track}.n_selected_bh", n_bh_rej,
             stage="fdr", track=short_track,
             meta={"estimand": "daily_cross_sectional_spearman_ic",
                   "bootstrap": "stationary_block",
                   "block_len": BLOCK_LENGTH_DAYS, "n_samples": N_BOOTSTRAP},
         )
         manifest.record(
-            f"fdr.{track}.n_selected_bhy", n_bhy_rej,
+            f"{fdr_ns}.{track}.n_selected_bhy", n_bhy_rej,
             stage="fdr", track=short_track,
         )
         manifest.record(
-            f"fdr.{track}.selected_features_bh", bh_selected,
+            f"{fdr_ns}.{track}.selected_features_bh", bh_selected,
             stage="fdr", track=short_track,
         )
         manifest.record(
-            f"fdr.{track}.selected_features_bhy", bhy_selected,
+            f"{fdr_ns}.{track}.selected_features_bhy", bhy_selected,
             stage="fdr", track=short_track,
         )
 
@@ -472,7 +478,7 @@ def main():
         for feat in features:
             s = boot_stats_all[feat]
             manifest.record(
-                f"fdr.{track}.feature.{feat}",
+                f"{fdr_ns}.{track}.feature.{feat}",
                 {"ic_bar": s["ic_bar"], "boot_p": s["boot_p"],
                  "ci_low": s["ci_low"], "ci_high": s["ci_high"],
                  "n_days": s["n_days"]},

@@ -465,14 +465,37 @@ def main() -> pd.DataFrame:
     feat_cols = [c for c in out.columns if c not in target_cols]
     out = out.dropna(subset=feat_cols, how="all")
 
+    # 7b. Screen 0 eligibility (look-ahead-free, R2000 universe).
+    #     For R2000 there are no PIT membership snapshots, so we apply only
+    #     the lagged price (≥$5) and lagged ADV (≥$1M) criteria — same thresholds
+    #     as spec.yaml screen0.  The result is stored as `s0_eligible` to keep
+    #     the downstream FDR / portfolio code working identically.
+    print("\n[Screen0] Computing R2000 look-ahead-free eligibility flags ...")
+    from src.data.screen0 import trailing_adv_usd as _adv_fn, lagged_min_price as _px_fn
+    _MIN_PRICE = 5.0     # spec.yaml screen0.min_price_usd
+    _MIN_ADV   = 1_000_000  # spec.yaml screen0.min_adv_usd
+    adv_series  = _adv_fn(daily)          # indexed (ticker, date)
+    lpx_series  = _px_fn(daily)           # indexed (ticker, date)
+    adv_ok   = adv_series  >= _MIN_ADV
+    price_ok = lpx_series  >= _MIN_PRICE
+    s0_eligible = (adv_ok & price_ok).rename("s0_eligible")
+    out["s0_eligible"] = s0_eligible.reindex(out.index).fillna(False)
+    out["adv_usd"] = adv_series.reindex(out.index)
+    n_elig = int(out["s0_eligible"].sum())
+    print(f"  Eligible rows: {n_elig:,} / {len(out):,} ({100*n_elig/len(out):.1f}%)")
+
     # 8. Enforce canonical column order (S&P order minus the 3 intraday).
+    #    Non-feature columns (s0_eligible, adv_usd) are appended after the
+    #    COLUMN_ORDER block so downstream consumers can find them.
+    NON_FEAT_EXTRA = [c for c in ["s0_eligible", "adv_usd"] if c in out.columns]
     missing = [c for c in COLUMN_ORDER if c not in out.columns]
-    extra = [c for c in out.columns if c not in COLUMN_ORDER]
+    extra = [c for c in out.columns if c not in COLUMN_ORDER and c not in NON_FEAT_EXTRA]
     if missing:
         print(f"  [WARN] expected columns missing: {missing}")
     if extra:
         print(f"  [WARN] unexpected extra columns: {extra}")
-    out = out[[c for c in COLUMN_ORDER if c in out.columns]]
+    ordered_cols = [c for c in COLUMN_ORDER if c in out.columns] + NON_FEAT_EXTRA
+    out = out[ordered_cols]
 
     # 9. Report + save.
     dates = out.index.get_level_values("date")
