@@ -150,7 +150,7 @@ OHLCV_PATH   = OUT_DIR / "daily_ohlcv.parquet"
 OUT_PATH     = OUT_DIR / "features_all.parquet"
 
 UNIVERSE_START = "2010-01-01"
-UNIVERSE_END   = "2024-12-31"
+UNIVERSE_END   = "2025-08-01"   # extended for the locked 2025 OOS window
 
 
 def main() -> pd.DataFrame:

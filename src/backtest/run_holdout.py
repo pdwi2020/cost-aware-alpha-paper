@@ -47,8 +47,8 @@ CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 OUT_PNL     = proc(ROOT, "holdout_pnl.parquet")
 OUT_METRICS = proc(ROOT, "holdout_metrics.parquet")
 
-HOLDOUT_START = "2022-01-01"
-HOLDOUT_END   = "2024-12-31"
+HOLDOUT_START = "2025-01-01"   # LOCKED single-touch OOS (2022-2024 demoted to exploratory)
+HOLDOUT_END   = "2025-07-31"   # data max
 
 # Fixed from IS: weekly rebalancing (Pareto-optimal from Week 9)
 REBAL_FREQ = 5
@@ -107,7 +107,7 @@ def build_returns_vol_adv_holdout(ohlcv, tickers, start, end):
 
 
 def main():
-    log("=== Exp 7: Holdout Validation 2022–2024 (FIRST TOUCH) ===\n")
+    log("=== Locked single-touch OOS validation 2025 (FIRST TOUCH) ===\n")
     log(f"  Holdout window: {HOLDOUT_START} → {HOLDOUT_END}")
     log(f"  Rebalancing: {REBAL_FREQ}-day (weekly, Pareto-optimal from Week 9)")
     log(f"  Costs: base case (spread=3bps, impact=0.10, AUM=$100M)\n")
@@ -133,8 +133,12 @@ def main():
         log(f"  Track: {track.upper()}")
         log(f"{'='*55}")
 
-        # Build signal weights from IS analysis (same as Week 8)
-        weights = build_signal_weights(track, fdr_df, shap_df)
+        # Build signal weights from FROZEN IS analysis (BH-selected features × SHAP)
+        try:
+            weights = build_signal_weights(track, fdr_df, shap_df)
+        except ValueError as e:
+            log(f"  [SKIP] {e} — no deployable {track} strategy under the corrected FDR.")
+            continue
 
         # Generate holdout signals (2022-2024)
         sig = generate_composite_signal(

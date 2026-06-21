@@ -53,7 +53,7 @@ SP500_DIR = ROOT / "datasets" / "sp500_holdings"
 OUT_DIR   = ROOT / "data" / "processed"
 
 UNIVERSE_START = "2010-01-01"
-UNIVERSE_END   = "2024-12-31"
+UNIVERSE_END   = "2025-08-01"   # extended to include the locked 2025 OOS window (data max 2025-08-01)
 FACTOR_WINDOW  = 252   # rolling OLS window (trading days) for beta estimation
 FWD_HORIZON    = 5     # 5-day forward return target
 
@@ -172,7 +172,7 @@ def load_daily_ohlcv(db: duckdb.DuckDBPyConnection, sp500_tickers: set) -> pd.Da
         FROM equities_ohlcv_1m
         WHERE ticker IN ('{ticker_sql}')
           AND (timestamp AT TIME ZONE 'America/New_York')::DATE >= '{UNIVERSE_START}'
-          AND (timestamp AT TIME ZONE 'America/New_York')::DATE <  '2025-01-01'
+          AND (timestamp AT TIME ZONE 'America/New_York')::DATE <= '{UNIVERSE_END}'
         GROUP BY ticker, (timestamp AT TIME ZONE 'America/New_York')::DATE
         ORDER BY ticker, date
     """
