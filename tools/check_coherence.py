@@ -15,9 +15,18 @@ Usage:
     python3 tools/check_coherence.py --strict          # exit 1 if unmatched
     python3 tools/check_coherence.py --show 20         # show first 20 unmatched
 
+Beyond the loose token scan, a set of *headline assertions* cross-checks the
+manuscript's FDR summary-table counts (BH-IC and TA-FDR rejections for each
+track, plus the /N feature-set denominator) against the authoritative
+manifest values. A mismatch there is a genuine contradiction and exits 2,
+independent of --strict. This catches manifest-vs-manuscript drift (e.g. a
+cross-universe run overwriting the primary FDR counts) that loose token
+matching cannot — a wrong number still "matches" if it appears anywhere else.
+
 Exit codes:
-    0 — all numbers matched (or --strict not set)
+    0 — all headline assertions pass (and no unmatched numbers under --strict)
     1 — unmatched numbers found (only with --strict)
+    2 — a headline assertion FAILED: the manuscript contradicts the manifest
 """
 
 from __future__ import annotations
@@ -121,6 +130,117 @@ def extract_tex_numbers(tex_path: Path) -> list[tuple[int, str, str]]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Headline assertions — structured, semantic cross-checks that specific
+# manuscript claims equal the authoritative manifest values.  Unlike the loose
+# token scan above, a failure here is a genuine contradiction (e.g. the manifest
+# says Track~A rejects 12 features but the paper's summary table shows a
+# different number), so it ALWAYS forces a non-zero exit, regardless of
+# --strict.  This guards against the manifest-vs-manuscript drift that loose
+# token matching cannot catch (a wrong number still "matches" if it happens to
+# appear somewhere else in the manifest).
+# ---------------------------------------------------------------------------
+
+def load_manifest_raw(manifest_path: Path) -> dict:
+    """Load the manifest as its raw {key: entry} dict (empty if absent)."""
+    if not manifest_path.exists():
+        return {}
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _manifest_number(manifest: dict, key: str, subpath: str | None = None):
+    """Return a numeric value from a manifest entry, or None if absent.
+
+    Without ``subpath`` the entry's ``value`` field is returned; with a dotted
+    ``subpath`` (e.g. ``"value.n_features"``) the nested field is returned.
+    """
+    entry = manifest.get(key)
+    if entry is None:
+        return None
+    if subpath:
+        node = entry
+        for part in subpath.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        return node
+    if isinstance(entry, dict):
+        return entry.get("value")
+    return entry
+
+
+# Candidate manifest keys for the pre-registered feature-set size (the "/N"
+# denominator in the FDR summary table). First match wins.
+FEATURE_COUNT_KEYS = [
+    ("ta_fdr.track_a.summary", "value.n_features"),
+    ("features.final_list", "meta.n_features"),
+]
+
+# Each assertion: (label, manifest_key, subpath, anchor_regex).  The regex must
+# capture the numerator as group 1 and (optionally) the denominator as group 2,
+# on the SAME manuscript line as the label (no DOTALL — avoids cross-line false
+# matches).
+HEADLINE_ASSERTIONS = [
+    ("BH-IC rejections (Track A)", "fdr.track_a.n_selected_bh", None,
+     r"BH-IC rejections\s*\(Track~A\).*?(\d+)\s*/\s*(\d+)"),
+    ("BH-IC rejections (Track B)", "fdr.track_b.n_selected_bh", None,
+     r"BH-IC rejections\s*\(Track~B\).*?(\d+)\s*/\s*(\d+)"),
+    ("TA-FDR rejections (Track A)", "tafdr.track_a.n_selected_bh", None,
+     r"TA-FDR rejections\s*\(Track~A\).*?(\d+)\s*/\s*(\d+)"),
+    ("TA-FDR rejections (Track B)", "tafdr.track_b.n_selected_bh", None,
+     r"TA-FDR rejections\s*\(Track~B\).*?(\d+)\s*/\s*(\d+)"),
+]
+
+
+def _feature_count(manifest: dict):
+    for key, sub in FEATURE_COUNT_KEYS:
+        v = _manifest_number(manifest, key, sub)
+        if v is not None:
+            return int(v)
+    return None
+
+
+def check_headline_assertions(
+    tex_text: str, manifest: dict
+) -> list[tuple[str, str, str]]:
+    """Cross-check headline FDR counts in the manuscript against the manifest.
+
+    Returns a list of ``(label, status, detail)`` where ``status`` is one of
+    ``"PASS"``, ``"FAIL"`` (a real contradiction), or ``"WARN"`` (the manifest
+    key or the manuscript anchor was not found, so the claim could not be
+    checked — advisory, non-fatal).
+    """
+    results: list[tuple[str, str, str]] = []
+    n_features = _feature_count(manifest)
+    for label, key, sub, pattern in HEADLINE_ASSERTIONS:
+        expected = _manifest_number(manifest, key, sub)
+        if expected is None:
+            results.append((label, "WARN", f"manifest key '{key}' absent"))
+            continue
+        expected = int(expected)
+        m = re.search(pattern, tex_text)
+        if not m:
+            results.append((label, "WARN", "anchor not found in manuscript"))
+            continue
+        shown_num = int(m.group(1))
+        detail = f"manuscript shows {shown_num}, manifest says {expected}"
+        if shown_num != expected:
+            results.append((label, "FAIL", detail))
+            continue
+        if m.lastindex and m.lastindex >= 2 and n_features is not None:
+            shown_den = int(m.group(2))
+            if shown_den != n_features:
+                results.append((
+                    label, "FAIL",
+                    f"{detail}; denominator {shown_den} != n_features {n_features}",
+                ))
+                continue
+            detail += f"; denom {shown_den}=={n_features}"
+        results.append((label, "PASS", detail))
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Check numeric coherence between manuscript and manifest."
@@ -198,6 +318,33 @@ def main() -> int:
     print(f"[SUMMARY] {n_matched}/{total} numbers are manifest-backed; "
           f"{n_unmatched} are hand-entered.")
 
+    # --- Headline assertion cross-checks (hard guard against manifest drift) ---
+    manifest_raw = load_manifest_raw(args.manifest)
+    tex_text = args.tex.read_text(encoding="utf-8", errors="replace")
+    assertions = check_headline_assertions(tex_text, manifest_raw)
+    n_fail = sum(1 for _, s, _ in assertions if s == "FAIL")
+    n_warn = sum(1 for _, s, _ in assertions if s == "WARN")
+
+    print()
+    print("=" * 60)
+    print("Headline FDR assertions (manuscript vs manifest)")
+    print("=" * 60)
+    marks = {"PASS": "PASS", "FAIL": "FAIL", "WARN": "WARN"}
+    for label, status, detail in assertions:
+        print(f"  [{marks[status]}] {label}: {detail}")
+    if n_fail:
+        print(f"\n[ASSERT] {n_fail} headline assertion(s) FAILED — "
+              f"the manuscript contradicts the manifest.")
+    elif n_warn:
+        print(f"\n[ASSERT] checked assertions pass ({n_warn} warning(s) — "
+              f"unverifiable, see above).")
+    else:
+        print("\n[ASSERT] all headline FDR counts match the manifest.")
+
+    # A headline contradiction is a real error: fail hard regardless of --strict.
+    if n_fail:
+        print(f"[EXIT 2] {n_fail} headline assertion failure(s).")
+        return 2
     if args.strict and n_unmatched > 0:
         print(f"[STRICT] Exiting 1 because {n_unmatched} unmatched numbers found.")
         return 1
