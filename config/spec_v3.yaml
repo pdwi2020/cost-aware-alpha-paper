@@ -1,0 +1,243 @@
+# =====================================================================
+# CAVAL specification v3: Results in Engineering revision
+# =====================================================================
+# Supersedes spec bcd59c0 (the Array submission). Frozen BEFORE the forward
+# holdout is scored: the git blob hash of this file gates that single touch,
+# and src/backtest/run_forward_holdout.py refuses to run unless the hash it was
+# given matches the committed one.
+#
+# Honesty invariant (unchanged): maximal effort is not a target Sharpe. The
+# forward window is reported as-is, whatever the sign. The deliverable is a
+# reproducible protocol plus candid evidence.
+#
+# Wording note: this file no longer says "pre-registered". The 30-feature family
+# was frozen after a development history that is disclosed in full
+# (results/search_ledger.csv), and discovery is re-tested on the enlarged
+# family (m' = 57). Reviewer 1 was right that "pre-registered" overstated it.
+
+meta:
+  spec_version: "3.0-rie"
+  created: "2026-09-15"
+  supersedes: "bcd59c0 (Array submission ARRAY-D-26-04174)"
+  venue: "Results in Engineering (Elsevier), single-anonymized"
+  status: "FROZEN on commit; the git blob hash of this file is what gates the forward run"
+
+# ---------------------------------------------------------------------
+# Data sources. All public and free; see datasets/OHLCV_1M_PROVENANCE.md
+# and datasets/sp500_daily_pit/PROVENANCE.md for pinned revisions.
+# ---------------------------------------------------------------------
+data:
+  daily_prices:
+    primary: "yfinance (split-adjusted close; adj_close carries dividends)"
+    fallback: "session-filtered 09:30-16:00 ET aggregation of the public 1-minute store"
+    panel: "data/processed/daily_ohlcv_v3.parquet"
+    rows: 2910460
+    tickers: 851
+    member_day_coverage_pct: 96.26
+    residual_gaps: 11        # bankruptcy shells / share class / pre-2010 spells
+  one_minute_store:
+    dataset: "mito0o852/OHLCV-1m (Hugging Face; originally Finnhub)"
+    revision: "776328445b7ac6e7815ef3a483e9c8ded1eb6d56"
+    coverage: "1992-01 .. 2026-03"
+    used_for: ["vwap_dev", "vol_clock", "vol_sig_ratio", "delisted-name recovery"]
+  membership:
+    source: "fja05680/sp500 (MIT) + Wikipedia cross-check"
+    file: "datasets/sp500_daily_pit/membership_daily.parquet"
+    member_days: 2119199
+    span: "2009-12-01 .. 2026-09-14"
+  factors:
+    source: "Kenneth R. French Data Library, daily FF5 + momentum"
+    vintage: "202607 CRSP build, downloaded 2026-09-16"
+    covers: "1963-07-01 .. 2026-07-31 (FF5); 1926-11-03 .. 2026-07-31 (momentum)"
+    refresher: "tools/refresh_ff_factors.py (checks the overlap, refuses to shorten the series)"
+    vintage_note: >
+      The vendor revises history. Against the previous mirror (ending 2026-02-27) the
+      overlap differs by up to 0.07 (FF5) and 1.23 (momentum) percentage points,
+      including inside the 2013-2021 in-sample window. Track A's target is a factor
+      residual, so refreshing moves every Track A number. The whole pipeline was
+      therefore re-run on this single vintage rather than mixing two.
+    hard_rule: >
+      No window may be scored past the factor end date. compute_track_a reindexes
+      factors onto the price calendar with method="ffill", so beyond 2026-07-31 every
+      factor is held constant and the "idiosyncratic" residual silently degenerates
+      toward the raw return. This is why the forward window below stops short of the
+      price panel, which runs to 2026-09-14.
+  macro: "FRED (VIXCLS, T10Y2Y, DTWEXBGS)"
+  known_defect_fixed: >
+    The Array-era panel aggregated the LAST bar of any session, so its daily
+    close was a post-market print (ACN 2013-06-03: 81.28 from a 19:50 bar vs an
+    official 82.10; old-vs-new return correlations AAPL 0.58, ACN -0.02). Both
+    v3 sources carry official closes.
+
+# ---------------------------------------------------------------------
+universes:
+  primary:
+    name: "pit_sp500_daily"
+    rule: "member at the close of t-1 (event-dated, one-trading-day lag)"
+    survivorship_delta_pct_full_panel: 35.02   # union vs PIT over the whole panel
+    survivorship_delta_pct_is_window: 39.19    # union vs PIT over 2013-2021, the figure
+                                               # the manuscript quotes (429,641 excess
+                                               # stock-days on 1,096,206 member-days);
+                                               # the Array version said 25.6, computed
+                                               # from incomplete annual snapshots
+  robustness:
+    name: "liquidity_topN"
+    rule: "top-N by trailing ADV, N=500; no membership data needed"
+  retired:
+    name: "pit_sp500_annual"
+    reason: >
+      Annual snapshots missed intra-year changes (Jaccard 0.59-0.93 against
+      daily membership) and the 2025 file was a late-2025 snapshot applied to
+      January 2025 (17 names were not yet members).
+
+# ---------------------------------------------------------------------
+screen0:
+  applied_at: "feature_build + signal masking"
+  decision_lag_days: 1
+  return_winsor_abs: 0.50
+  min_price_usd: 5.0
+  min_adv_usd: 1000000
+  position_rule: >
+    Mask ineligible names in the SIGNAL before z-scoring, gross normalisation
+    and the water-fill cap, then exit ineligible holdings daily WITHOUT
+    renormalising. The old post-hoc renormalisation breached the 5% cap on
+    10.7% of days (max weight 8.16%).
+  split_adjustments: "results/universe_v3/splits_adjusted.csv (10 verified; crash guard rejects false positives)"
+
+# ---------------------------------------------------------------------
+features:
+  family_size: 30
+  wording: "frozen specification, not pre-registration"
+  disclosure: "results/search_ledger.csv (52 rows)"
+  enlarged_family: 57               # m' for the search-adjusted sensitivity
+  intraday_available_until: "2026-03-31"
+  tracks:
+    A: "FF5+UMD-residual 5-day idiosyncratic forward return"
+    B: "raw 5-day forward return"
+
+# ---------------------------------------------------------------------
+windows:
+  warmup: "2010-2012"
+  in_sample: "2013-01-01 .. 2021-12-31"
+  exploratory: "2022-01-01 .. 2024-12-31"
+  previously_touched: "2025-01-01 .. 2025-07-31"   # the Array submission's locked window
+  forward_holdout:
+    start: "2025-08-01"
+    end: "2026-07-31"            # was 2026-08-31; capped by factor availability
+    touches_allowed: 1
+    primary: "2025-08-01 .. 2026-03-31"
+    secondary: "2025-08-01 .. 2026-07-31 (daily-only composite, renormalised weights)"
+    rule_if_composite_uses_intraday_features: >
+      If the frozen composite contains any 1-minute-derived feature (vwap_dev,
+      vol_clock, vol_sig_ratio), the PRIMARY forward window is
+      2025-08-01..2026-03-31, where those features exist, and a daily-only
+      composite with renormalised weights is reported as a SECONDARY result over
+      the full window. If it contains none, the primary window is the full span.
+      overnight_gap is daily-computable and does not trigger this rule.
+    window_determination: >
+      Both bounds are set by DATA AVAILABILITY and fixed before the window is
+      scored, not by inspecting any result. The deployed Track A composite
+      contains vwap_dev, whose 1-minute source ends 2026-03-31, which sets the
+      primary window. The factor mirror ends 2026-07-31, which caps the secondary
+      window and is why the end date moved down from the 2026-08-31 originally
+      drafted. Scoring past either bound would evaluate a different estimand
+      rather than a shorter one.
+
+# ---------------------------------------------------------------------
+fdr:
+  estimand: "daily cross-sectional Spearman IC"
+  null: "stationary block bootstrap (Politis-Romano), recentred"
+  block_length_days: 21
+  n_samples: 1000
+  q: 0.10
+  methods: ["BH", "BHY"]
+  search_adjusted: ["enlarged m'=57 (p=1 for untestable dropped hypotheses)", "Harvey-Liu-Zhu |t|>3"]
+
+ta_fdr:
+  version: 3
+  hypothesis: "H0_f: E[r_net,f] <= 0 vs H1_f: E[r_net,f] > 0"
+  statistic: "mean daily net return"
+  null: "recentred joint stationary block bootstrap of the aligned gross P&L"
+  block_length_days: 21
+  n_samples: 2000
+  reports: ["p_net", "p_gross (cost-blind, same draws)", "p_stud (bootstrap-t)"]
+  invariant: "p_net >= p_gross always (Lean: pval_antitone / tafdr_conservative)"
+  supersedes: >
+    v2 subtracted an identical fixed cost vector from both the observed
+    statistic and every draw, so costs cancelled and the p-value was a
+    gross-return p-value; its books also used raw returns without Screen 0 and
+    charged half the deployed spread.
+
+# ---------------------------------------------------------------------
+portfolio:
+  gross_exposure_target: 1.0
+  max_single_position: 0.05
+  cap_algorithm: "iterative_waterfill"
+  implementation_lag_days: 1
+  rebalancing_frequency_days: 5
+  aum_dollars: 100000000
+  signal: "sign(mean IC) x weight x feature, L1-normalised over the selected set"
+
+costs:
+  model: "square-root participation impact (not Almgren-Chriss linear)"
+  spread_convention: "spread_bps is the HALF-spread, charged per unit of one-way turnover"
+  scenarios:
+    optimistic_fixed: {spread_bps: 3.0, impact_coeff: 0.10, borrow_bps: 0}
+    calibrated: {spread: "Abdi-Ranaldo stock-day (lagged 2d)", impact_coeff: 0.142, borrow: "25 GC / 300 HTB"}
+    conservative: {spread: "Corwin-Schultz stock-day (lagged 1d)", impact_coeff: 0.50, borrow: "25 GC / 500 HTB"}
+  argument: >
+    A "not tradable" verdict must hold at the OPTIMISTIC bound, so the original
+    fixed parameters are retained as that bound and the calibrated model is
+    reported alongside.
+
+# ---------------------------------------------------------------------
+validation:
+  pbo:
+    method: "CSCV over the deployed SELECTION PATH"
+    blocks: 16
+    candidate_sets: [54, 162]        # 162 also treats cost settings as searched
+    caveat: "selection estimated on the full IS window, so PBO is a lower bound"
+  dsr: {trial_count: "the actual number of configurations searched"}
+  conformal: {alpha: 0.10, role: "diagnostic_only"}
+  economic_threshold:
+    sr_star: 0.5
+    sensitivity: [0.3, 0.75]
+    basis: "Grinold & Kahn information-ratio scale; see results/staging/economic_threshold_note.md"
+    classification: "90% bootstrap CI -> significant_and_meaningful | significant_but_small | practically_null | inconclusive | significantly_negative"
+  factor_adjustment: "FF5+UMD HAC regression of the book's daily P&L (dollar-neutral is not beta-neutral)"
+
+formal:
+  lean: "formal/CavalFormal (unchanged; zero sorry)"
+  proposition_1: "maps to the v3 recentred design: same bootstrap deviations, lower observed statistic"
+
+# ---------------------------------------------------------------------
+reproducibility:
+  manifest_dir: "results/manifest/"
+  regenerator: >
+    tools/regenerate_numbers.py emits every manifest entry as a LaTeX macro into
+    paper/generated_numbers.tex, which main.tex inputs. Most table and prose
+    figures are still typed literals checked against the manifest rather than
+    expanded from it; the macros are authoritative where they are used.
+  coherence_check: >
+    tools/check_coherence.py must exit 0. It exits 2 if any of its headline
+    assertions contradicts the manifest, which is the hard gate. Its optional
+    --strict flag additionally lists numeric tokens with no manifest counterpart
+    and always exits 1 (ORCIDs, DOIs, "S&P 500"), so that list is advisory.
+  recorders: >
+    tools/record_synthesis.py and tools/record_battery.py derive the cross-stage
+    and battery manifest entries from stage outputs. They exist because the
+    stages that produced those numbers did not write to the manifest, so the
+    values had been hand-transcribed and survived a full re-run unchanged.
+  archived_predecessor: "/Volumes/Crucial X9/Research Projects/ML_Paper/archive/processed_v2_array/"
+  run_order:
+    - "src/data/build_daily_pit.py --stages all"
+    - "src/data/recover_delisted_prices.py"
+    - "src/features/build_features.py"
+    - "src/features/build_features_all.py"
+    - "src/models/run_walk_forward.py"
+    - "src/models/shap_analysis.py"
+    - "src/fdr/run_fdr.py  (+ run_bhy, placebo, embargo, run_search_adjusted_fdr)"
+    - "src/backtest/run_ta_fdr.py --B 2000"
+    - "src/fdr/run_pbo_selection_path.py"
+    - "src/backtest/ (signals, backtest, sensitivity, baselines, cost battery)"
+    - "FREEZE spec v3, then src/backtest/run_forward_holdout.py exactly once"
