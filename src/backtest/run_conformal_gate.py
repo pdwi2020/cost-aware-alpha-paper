@@ -55,6 +55,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+from src.manifest import get  # noqa: E402
+
 DATA = ROOT / "data" / "processed"
 OUT  = DATA / "conformal_gate.parquet"
 
@@ -108,12 +110,20 @@ def main():
     feat = pd.read_parquet(DATA / "features_all.parquet")
     is_metrics = pd.read_parquet(DATA / "backtest_base.parquet")
 
-    # ── Acceptance check: ungated must match headline ────────────────────────
+    # ── Acceptance check: ungated must match the recorded headline ──────────
+    # This compared against a hardcoded +0.357, the Array-era value. The
+    # constant went stale and blocked the stage entirely rather than flagging
+    # drift, which is the failure mode a guard is supposed to prevent. It now
+    # reads the expectation from the manifest, so it tracks the pipeline.
     net_ungated = pnl["net_pnl"].to_numpy(float)
     sr_ungated  = sharpe_ann(net_ungated)
-    # Screen-0 headline: Track B OOS net Sharpe = +0.357 (was +0.50 pre-Screen-0)
-    assert abs(sr_ungated - 0.357) < 0.02, (
-        f"Ungated net SR={sr_ungated:.3f} ≠ +0.357 ± 0.02 — data mismatch"
+    expected = get("window.locked_oos_2025.track_b.net_sharpe")
+    if expected is None:
+        raise SystemExit("manifest has no window.locked_oos_2025.track_b.net_sharpe; "
+                         "run src/backtest/run_holdout.py first")
+    assert abs(sr_ungated - expected) < 0.02, (
+        f"Ungated net SR={sr_ungated:.3f} != manifest {expected:.3f} +/- 0.02 "
+        f"— the P&L file and the manifest describe different runs"
     )
 
     # ── Variant 1 parameters (IS-only, frozen) ───────────────────────────────
@@ -124,10 +134,17 @@ def main():
     print(f"V1 IS params: q̂_calm={q_calm_mean:.4f}  q̂_stressed={q_stressed_mean:.4f}"
           f"  m_stressed={m_stressed_v1:.4f}")
 
-    # VIX time series (OOS) — same-day, no lookahead via 1-day position lag
+    # VIX time series over the evaluated window — same-day, no lookahead via
+    # the 1-day position lag.
+    #
+    # This was hardcoded to 2022-01-01..2024-12-31 while the P&L it gates is
+    # the locked 2025 window. Reindexing a 2022-24 series onto 2025 dates gives
+    # all-NaN, so `vix > 20` was False on every day and Variant 1 never fired.
+    # The "Variant 1 lowers net Sharpe" result was an artefact of that, not a
+    # finding. The slice now follows the P&L.
     dv = feat.index.get_level_values("date")
-    oos_feat = feat[(dv >= "2022-01-01") & (dv <= "2024-12-31")]
-    vix = oos_feat.groupby(level="date")["vix"].first()
+    win = feat[(dv >= pnl.index.min()) & (dv <= pnl.index.max())]
+    vix = win.groupby(level="date")["vix"].first()
     vix.index = pd.to_datetime(vix.index)
     vix = vix.reindex(pnl.index).ffill()
 
