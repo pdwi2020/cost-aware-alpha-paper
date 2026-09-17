@@ -49,11 +49,14 @@ from src.data.screen0 import screen0_eligibility, survivorship_delta
 from src.features.tier1_classic import build_tier1_features, compute_residualized_returns
 
 CATALOG  = os.environ.get("DUCKDB_CATALOG", "/Volumes/Crucial X9/data/catalog.duckdb")
-SP500_DIR = ROOT / "datasets" / "sp500_holdings"
+SP500_DIR = ROOT / "datasets" / "sp500_holdings"   # legacy annual snapshots (comparison only)
 OUT_DIR   = ROOT / "data" / "processed"
 
 UNIVERSE_START = "2010-01-01"
-UNIVERSE_END   = "2025-08-01"   # extended to include the locked 2025 OOS window (data max 2025-08-01)
+# v3: the panel now runs to the end of available data. The forward window is
+# sealed for EVALUATION by config/spec.yaml, not by truncating the feature
+# panel: features must exist before the frozen specification can be scored once.
+UNIVERSE_END   = "2026-09-14"
 FACTOR_WINDOW  = 252   # rolling OLS window (trading days) for beta estimation
 FWD_HORIZON    = 5     # 5-day forward return target
 
@@ -285,13 +288,22 @@ def main() -> pd.DataFrame:
 
     db = duckdb.connect(CATALOG, read_only=True)
 
-    # 1. Universe tickers
-    sp500_tickers = get_universe_tickers(str(SP500_DIR))
-    print(f"SP500 union tickers (2010-2024): {len(sp500_tickers)}")
+    # 1. Universe tickers — daily, event-dated point-in-time membership.
+    from src.data import universe_v3
 
-    # 2. Daily OHLCV
-    daily = load_daily_ohlcv(db, sp500_tickers)
-    print(f"Daily OHLCV: {daily.shape}  ({daily['ticker'].nunique()} tickers)")
+    sp500_tickers = universe_v3.pit_tickers(UNIVERSE_START, UNIVERSE_END)
+    print(f"PIT members (daily membership, {UNIVERSE_START}..{UNIVERSE_END}): "
+          f"{len(sp500_tickers)}")
+
+    # 2. Daily OHLCV — the hybrid v3 panel (yfinance + session-filtered 1-minute
+    #    bars for members Yahoo dropped). This replaces the old 1-minute resample,
+    #    whose close was the last EXTENDED-HOURS print rather than the official
+    #    close; see src/data/universe_v3.py for the evidence.
+    daily = universe_v3.load_panel(UNIVERSE_START, UNIVERSE_END)
+    daily = daily[daily["ticker"].isin(sp500_tickers)].reset_index(drop=True)
+    print(f"Daily OHLCV (v3 panel): {daily.shape}  ({daily['ticker'].nunique()} tickers)")
+    if "source" in daily.columns:
+        print("  source mix:", daily.groupby("source")["ticker"].nunique().to_dict())
 
     # 3. Sanitize prices BEFORE any feature computation
     #    This replaces the `close` column with close_clean (cumproduct of clipped returns).
@@ -303,7 +315,10 @@ def main() -> pd.DataFrame:
         # Count residual artifacts for verification
         close_w_chk = daily.pivot(index="date", columns="ticker", values="close")
         r_chk = close_w_chk.pct_change(fill_method=None)
-        n_residual = int((r_chk.abs() > cap).sum().sum())
+        # Tolerance, not a bare `> cap`: the clean series is rebuilt by
+        # compounding clipped returns, so a clipped +50% day can come back as
+        # 0.5000000000000002 and a strict comparison reports phantom residuals.
+        n_residual = int((r_chk.abs() > cap + 1e-9).sum().sum())
         print(f"  [verify] Residual |ret|>{cap:.0%} cells after sanitization: {n_residual}")
         if n_residual > 0:
             print(f"  [WARN] Non-zero residuals — check for extreme close[t=0] values or NaN gaps")
@@ -372,9 +387,13 @@ def main() -> pd.DataFrame:
     daily_for_screen = daily.copy()
     daily_for_screen["date"] = pd.to_datetime(daily_for_screen["date"])
 
-    s0_series = screen0_eligibility(
-        daily_for_screen, str(SP500_DIR), universe=universe_choice
-    )
+    if universe_choice == "pit":
+        # Daily membership, lagged one trading day per ticker.
+        s0_series = universe_v3.screen0_daily(daily_for_screen)
+    else:
+        s0_series = screen0_eligibility(
+            daily_for_screen, str(SP500_DIR), universe=universe_choice
+        )
     # trailing ADV (lagged) — reuse the same window for the column we attach
     from src.data.screen0 import trailing_adv_usd as _adv_fn
     adv_series = _adv_fn(daily_for_screen)
@@ -389,8 +408,11 @@ def main() -> pd.DataFrame:
     print(f"  Eligible rows: {n_eligible:,} / {n_total:,} "
           f"({100*n_eligible/n_total:.1f}%)  [{time.time()-t_s0:.0f}s]")
 
-    # Survivorship-bias delta: quantify what the union→PIT switch removes
-    s_delta = survivorship_delta(daily_for_screen, str(SP500_DIR))
+    # Survivorship-bias delta: quantify what the union→PIT switch removes,
+    # now against daily membership rather than annual snapshots.
+    s_delta = universe_v3.survivorship_delta_daily(
+        daily_for_screen, UNIVERSE_START, UNIVERSE_END
+    )
     print(f"  Survivorship delta (union vs PIT): {s_delta}")
     try:
         from src.manifest import record as _manifest_record
@@ -411,7 +433,10 @@ def main() -> pd.DataFrame:
     print(f"{'Feature':<25s}  {'|val|>50% count':>17s}")
     for c in ret_feats_chk + tgt_chk:
         if c in out.columns:
-            n = int((out[c].abs() > 0.50).sum())
+            # Same tolerance as above. Multi-day features (ret_5d/21d/63d) can
+            # legitimately exceed 50% by compounding; only the 1-day series is
+            # bounded by the cap.
+            n = int((out[c].abs() > 0.50 + 1e-9).sum())
             print(f"  {c:<23s}  {n:>15,}")
 
     # --- Summary ---

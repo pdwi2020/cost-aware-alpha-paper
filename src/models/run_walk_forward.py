@@ -40,15 +40,36 @@ def main():
     # ------------------------------------------------------------------
     # 1. Load features
     # ------------------------------------------------------------------
-    log("Loading features_all.parquet...")
-    df = pd.read_parquet(FEATURES_PATH)
+    # Lean load: only the modelled columns, and float32 rather than float64.
+    # The full 47-column float64 panel pushed this machine into ~13 GB of swap
+    # on a volume with under 2 GB free, which is a hard failure rather than a
+    # slow one. The models are insensitive to the dropped precision.
+    import pyarrow.parquet as pq
+
+    from src.features.feature_spec import ADDED_INTERACTIONS, KEPT_FEATURES
+
+    log("Loading features_all.parquet (modelled columns only, float32)...")
+    available = set(pq.read_schema(FEATURES_PATH).names)
+    feat_cols = [c for c in list(KEPT_FEATURES) + list(ADDED_INTERACTIONS)
+                 if c in available]
+    target_cols = [c for c in ("target_track_a", "target_track_b") if c in available]
+
+    # s0_eligible must come along: ModelSuite.fit_all_folds restricts training
+    # and test rows to Screen 0-eligible names when the column is present, so
+    # dropping it would silently widen the estimand.
+    keep_cols = feat_cols + [c for c in ("s0_eligible",) if c in available]
+
+    df = pd.read_parquet(FEATURES_PATH, columns=keep_cols + target_cols)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])],
     )
-    feat_cols = [c for c in df.columns if not c.startswith("target")]
-    log(f"  Shape: {df.shape}  |  Feature cols: {len(feat_cols)}")
+    for col in df.columns:
+        if df[col].dtype == "float64":
+            df[col] = df[col].astype("float32")
+    log(f"  Shape: {df.shape}  |  Feature cols: {len(feat_cols)}  "
+        f"|  {df.memory_usage(deep=True).sum() / 1e9:.2f} GB in memory")
 
-    features = df[feat_cols]
+    features = df[keep_cols]
 
     # ------------------------------------------------------------------
     # 2. Fold dates

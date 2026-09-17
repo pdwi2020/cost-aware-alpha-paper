@@ -64,11 +64,14 @@ def preprocess(
 ) -> tuple:
     """Preprocess features for one fold.
 
-    All 32 pre-registered features are cross-sectional (stock-level signals
-    that survive daily demeaning). The broadcast macro columns have been
-    dropped from the feature set; their information re-enters via the
-    stock-specific beta interaction terms (beta_x_vix, beta_x_term_spread,
-    credit_beta_x_credit) which ARE stock-varying and receive XS treatment.
+    Columns come from ``feature_spec.feature_columns`` (the 30 features of the
+    frozen specification), not from whatever the caller happens to pass, so
+    extra columns in the frame -- ``s0_eligible``, ``adv_usd``, regime labels,
+    the dropped broadcast macros -- are never model inputs. All 30 are
+    cross-sectional (stock-level signals that survive daily demeaning); macro
+    information re-enters only through the stock-specific beta interactions
+    (beta_x_vix, beta_x_term_spread, credit_beta_x_credit), which do vary
+    across names and so receive the same cross-sectional treatment.
 
     Returns (X_tr_np, X_te_np, feat_cols): float32 arrays, NaN → 0.
     """

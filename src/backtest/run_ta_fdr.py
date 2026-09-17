@@ -1,79 +1,102 @@
-"""IA1+IA2 — Tradable-Alpha FDR (TA-FDR) with stationary-block-bootstrap null.
+"""IA1+IA2 — Tradable-Alpha FDR (TA-FDR) with a recentred joint bootstrap null.
 
-## Design (v2 — corrected statistic and joint null)
+## Design (v3 — cost-aware net p-values via books.single_feature_book)
 
-### Statistic
-For each candidate feature f (IS 2013-2021 only):
-  T_f = mean(net_return)  — the mean daily net return of the single-feature strategy
-        run through a square-root participation cost model.
-  Signal = sign(mean_IC_f) × feature_f values (cross-sectionally z-scored per date).
+### Why v2 was invalid
+The previous ("v2") design paired ORIGINAL-order positions with BLOCK-RESAMPLED
+returns and subtracted the SAME FIXED cost vector from both the observed
+statistic and every bootstrap draw:
+    net_b = (pos_ * ret_b).sum(axis=1) - costs_
+with `costs_` identical across draws and identical between the observed
+computation and the null. Because the identical `costs_` is subtracted on
+both sides of the `null >= t_obs` comparison, the comparison — and hence the
+p-value — is invariant to the magnitude of `costs_`: v2's p-value was
+mathematically a gross-return p-value in disguise, no matter how large costs
+were (see `TestCostMonotonicity.test_old_design_p_is_cost_invariant` in
+tests/test_ta_fdr_null.py for a machine-checked demonstration). v2 also built
+books from raw `close.pct_change()` (skipping Screen 0's +/-50% return
+winsorisation) and charged `spread_bps/2` per unit turnover, half of what the
+deployed `PortfolioSimulator.simulate_pnl` actually charges.
 
-  Rationale: net = gross - cost with cost >= 0, so mean(net) <= mean(gross) holds
-  POINTWISE.  This is the statistic for which the cost-aware conservativeness result
-  is actually valid.  The Sharpe ratio is NOT valid here because its denominator
-  changes under the null, which invalidates the comparison.
+v3 fixes all three problems by routing every book through
+`src.backtest.books.single_feature_book`, which applies Screen 0
+(`mask_signal_screen0` + `apply_s0_daily_exit`), the sanitised/clipped return
+panel (`books.load_market_panel` -> `run_backtest.build_returns_vol_adv`), and
+the deployed simulator's cost convention unmodified — and by resampling the
+feature's own daily GROSS P&L series (positions and returns already paired at
+each date) instead of pairing original-order positions with resampled
+returns.
 
-### Square-root participation cost model
-  total impact ~ turnover^{3/2}
-  (impact_coeff * sigma * sqrt(participation_fraction) * delta_abs)
-  This is a square-root participation cost model, NOT the Almgren-Chriss (2001)
-  linear transient-decay model.
+### Hypotheses & statistic
+Per feature f (IS 2013-01-01..2021-12-31 only):
+    H0_f: E[r_net,f] <= 0   vs   H1_f: E[r_net,f] > 0
+where r_net,f,t = g_f,t - c_f,t is feature f's single-feature book's daily net
+return from `books.single_feature_book` (weekly rebalance, REBAL_FREQ=5).
+Statistic: T_f = mean_t r_net,f,t = mean(g_f) - mean(c_f).
 
-### Joint null (stationary block bootstrap)
-Repeat B times (default 1000):
-  1. Draw ONE shared resample of date-block indices using the stationary block
-     bootstrap (Politis-Romano; geometric block lengths with mean = block_length_days
-     = 21 days).  Apply the SAME resampled date ordering to the RETURN/target panel
-     for ALL features in that draw.
-  2. For each feature, pair its ORIGINAL-ORDER position array with the BLOCK-
-     RESAMPLED return array.  The feature/position panel keeps its original date
-     order; pairing original-order signals with block-resampled returns breaks the
-     predictive alignment while PRESERVING:
-       (a) within-date cross-sectional dependence (whole columns/dates move together)
-       (b) per-ticker autocorrelation (contiguous blocks maintain local time-series
-           structure; a geometric-mean block length of 21 days is long relative to
-           the 5-day return horizon)
-  3. Recompute costs using the FIXED positions (turnover depends only on positions,
-     not on realised returns), then compute net = pos * ret_resampled - costs.
-  4. T_f^(b) = mean(net_b)   (same statistic as observed).
+### Orientation sign
+sign_f = sign(ic_bar) read from data/processed/fdr_results.parquet for the
+matching track/feature row; +1.0 if the feature is missing from that track's
+rows, or ic_bar is 0/NaN (see `orientation_signs`).
 
-  The joint resampling ensures the null distribution properly reflects the
-  cross-sectional dependence structure across features.
+### Joint null — recentred stationary block bootstrap
+For each track, ONE shared (B, T) index matrix is drawn via
+`_draw_stationary_block_bootstrap_indices` (Politis-Romano; geometric block
+lengths, mean = block_length_days from config/spec.yaml, default 21) — the
+SAME index matrix is reused across every feature, which is what makes the
+null "joint": cross-feature dependence in the resampled panel is preserved
+because every feature is resampled along the identical date permutation for a
+given draw b.
 
-### p-value + BH + BHY
-  p_f = (1 + #{T_f^(b) >= T_f}) / (1 + B)    (one-sided: high T_f is signal)
-  Apply BH  at q=0.10 on {p_f} → BH TA-FDR accepted set.
-  Apply BHY at q=0.10 on {p_f} → BHY TA-FDR accepted set (valid under arbitrary
-  dependence, appropriate given the cross-sectional correlations among features).
+For each feature, vectorised over draws (no Python loop over b):
+    resampled_b = g_f[idx_matrix]                        # (B, T)
+    D_b         = resampled_b.mean(axis=1) - mean(g_f)    # (B,) recentred null
 
-### Prior-art delta (must cite in paper)
-- Bajgrowicz & Scaillet (2012, JFE): rules / proportional cost / single time-series.
-  Our delta: cross-sectional feature discovery / size-dependent participation cost /
-  joint stationary block bootstrap null / regime-aware walk-forward protocol.
-- alpha-investing (Foster & Stine 2008, JRSS-B): data-collection cost, not market
-  impact.  Our delta: market-impact wealth penalty (the more you trade a feature,
-  the more impact you pay, even under the null).
+    p_net   = (1 + #{b: D_b >= T_f})        / (1 + B)
+    p_gross = (1 + #{b: D_b >= mean(g_f)})  / (1 + B)      # SAME D_b, gross bar
 
-### OOS validation
-After TA-FDR selection (IS only), rerun OOS 2022-2024 with the TA-FDR composite
-and compare to the static-BH composite. Acceptance: static-BH OOS net SR = 0.50 +/-0.02.
+Since T_f <= mean(g_f) whenever costs >= 0, and the exceedance count is
+non-increasing in the threshold, p_net >= p_gross ALWAYS. This is exactly
+`pval_antitone` / `tafdr_conservative` from formal/CavalFormal/TAFdr.lean, and
+is asserted in `compute_bootstrap_pvalues` on every feature.
 
-Outputs:
-    data/processed/ta_fdr.parquet             — per-feature statistics + rejection flags
-    data/processed/ta_fdr_oos_metrics.parquet — OOS comparison: static-BH vs TA-FDR
-    data/processed/ta_fdr_null_dist.parquet   — null distributions (optional)
+### Studentised bootstrap-t (robustness)
+t_f = T_f / se_f, se_f = bootstrap sd of {D_b}. A full double (nested)
+bootstrap is too slow for B up to 2000 x 30 features x 2 tracks, so the
+per-draw studentising denominator se_f^(b) uses a closed-form stationary-
+bootstrap HAC-type (Newey-West, Bartlett kernel, maxlags=block_length)
+standard error of the mean, computed directly on each draw's resampled series
+`resampled_b[b, :]` (no further resampling) — see `_bartlett_hac_var_of_mean`.
+    t_b    = D_b / se_f^(b)
+    p_stud = (1 + #{b: t_b >= t_f}) / (1 + B)
 
-Run (slow — ~30-60 min with B=1000):
-    python3 -u src/backtest/run_ta_fdr.py
+### BH / BHY
+Applied at q=0.10 (FDR_Q) separately per track and separately on {p_net},
+{p_gross}, {p_stud} (six reject sets total per track).
 
-For a fast test with B=50:
-    python3 -u src/backtest/run_ta_fdr.py --B 50
+### Outputs
+    data/processed/ta_fdr_v3.parquet             — per track x feature statistics
+    data/processed/ta_fdr_v3_null_summary.parquet — per track x feature null mean/sd
+    results/staging/ta_fdr_v3_summary.json        — run metadata + rejection counts
+The v2 outputs are renamed (not deleted):
+    data/processed/ta_fdr.parquet             -> ta_fdr.parquet.v2_invalid_null
+    data/processed/ta_fdr_oos_metrics.parquet -> ta_fdr_oos_metrics.parquet.v2_invalid_null
+v3 does not call src.manifest.record and does not evaluate anything after
+2021-12-31 (the old OOS 2022-2024 comparison is removed — out of scope here).
+
+Run (slow — B=2000 default, ~30-90 min):
+    python3 -u src/backtest/run_ta_fdr.py --B 2000
+
+For a fast smoke test:
+    python3 -u src/backtest/run_ta_fdr.py --B 20 --tracks track_b
 """
 
 import argparse
+import json
 import sys
 import time
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -85,26 +108,28 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+from src.backtest import books
 from src.backtest.portfolio import PortfolioSimulator
 from src.fdr.bh_correction import benjamini_hochberg, bhy_procedure
 from src.features.feature_spec import feature_columns as get_feature_columns
-from src.manifest import record as manifest_record
 
 FDR_PATH   = ROOT / "data" / "processed" / "fdr_results.parquet"
-SHAP_PATH  = ROOT / "data" / "processed" / "shap_summary.parquet"
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 SPEC_PATH  = ROOT / "config" / "spec.yaml"
 
-OUT_TAFDR   = ROOT / "data" / "processed" / "ta_fdr.parquet"
-OUT_OOS     = ROOT / "data" / "processed" / "ta_fdr_oos_metrics.parquet"
-OUT_NULL    = ROOT / "data" / "processed" / "ta_fdr_null_dist.parquet"
+# v2 (invalid-null) outputs — renamed, not deleted, at the start of main().
+OLD_TAFDR_PATH = ROOT / "data" / "processed" / "ta_fdr.parquet"
+OLD_OOS_PATH   = ROOT / "data" / "processed" / "ta_fdr_oos_metrics.parquet"
+
+# v3 outputs.
+OUT_TAFDR_V3      = ROOT / "data" / "processed" / "ta_fdr_v3.parquet"
+OUT_NULL_V3       = ROOT / "data" / "processed" / "ta_fdr_v3_null_summary.parquet"
+OUT_SUMMARY_JSON  = ROOT / "results" / "staging" / "ta_fdr_v3_summary.json"
 
 IS_START   = "2013-01-01"
 IS_END     = "2021-12-31"
-HOLDOUT_START = "2022-01-01"
-HOLDOUT_END   = "2024-12-31"
 FDR_Q      = 0.10
 REBAL_FREQ = 5
 VOL_WINDOW = 21
@@ -114,13 +139,28 @@ with open(SPEC_PATH) as _f:
     _spec = yaml.safe_load(_f)
 _ta_spec = _spec["ta_fdr"]
 BLOCK_LEN  = int(_ta_spec.get("block_length_days", 21))   # stationary bootstrap mean block length
-N_SAMPLES  = int(_ta_spec.get("n_samples", 1000))         # B permutation draws
+N_SAMPLES  = int(_ta_spec.get("n_samples", 1000))         # B bootstrap draws
 
 
 def log(msg): print(msg, flush=True)
 
 
-# ── Data helpers ──────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
+# LEGACY COMPATIBILITY LAYER — DO NOT MODIFY OR REMOVE
+#
+# src/fdr/run_pbo_deployed.py imports IS_START, IS_END, REBAL_FREQ,
+# VOL_WINDOW, _precompute_pnl_components, build_single_feature_signal, and
+# load_ohlcv_matrices directly and depends on their EXACT current behavior
+# (including the pre-v3 spread/cost/Screen-0 conventions). src/knockoffs/
+# run_gaussian_knockoffs.py and run_cost_aware_knockoffs.py additionally
+# import estimate_ic_signs and load_ohlcv_matrices (those two files are
+# currently broken for an unrelated reason — they also import a
+# `_fast_net_sharpe` name that has never existed in this module — which is a
+# pre-existing state on this branch, not caused by this change; out of scope
+# here). A later task will migrate these callers onto src.backtest.books and
+# retire this layer. Until then it must stay byte-for-byte identical to the
+# v2 implementation.
+# ═════════════════════════════════════════════════════════════════════════
 
 def load_ohlcv_matrices(ohlcv: pd.DataFrame, tickers: list, start: str, end: str):
     mask = (
@@ -174,8 +214,6 @@ def _compute_mean_net_return(
     return float(net.mean())
 
 
-# ── Pre-compute positions + costs (called once per feature, not per draw) ─────
-
 def _precompute_pnl_components(
     signal: pd.DataFrame,
     returns: pd.DataFrame,
@@ -194,8 +232,8 @@ def _precompute_pnl_components(
 
     Costs are computed from positions (turnover) and depend on sigma and
     adv but NOT on realised returns, so they can be precomputed once and
-    reused across all bootstrap draws.  The joint null holds positions
-    and costs fixed; only ret_arr is replaced by resampled returns.
+    reused across all bootstrap draws. Legacy (v2) cost convention — see
+    module-level LEGACY COMPATIBILITY LAYER note.
     """
     if signal.empty or len(signal) < 50:
         return None
@@ -244,8 +282,6 @@ def _precompute_pnl_components(
     return pos_, ret_, costs
 
 
-# ── Stationary block bootstrap ────────────────────────────────────────────────
-
 def _draw_stationary_block_bootstrap_indices(
     T: int,
     block_length: int,
@@ -254,7 +290,7 @@ def _draw_stationary_block_bootstrap_indices(
     """Draw one resample of T indices using the stationary block bootstrap.
 
     Politis & Romano (1994): block lengths are geometrically distributed with
-    mean = block_length.  Start positions are drawn uniformly from [0, T).
+    mean = block_length. Start positions are drawn uniformly from [0, T).
     The resample wraps around (circular) so every position is equally likely.
 
     Parameters
@@ -285,8 +321,6 @@ def _draw_stationary_block_bootstrap_indices(
     return idx
 
 
-# ── IC sign estimation ────────────────────────────────────────────────────────
-
 def estimate_ic_signs(
     feat_df: pd.DataFrame,
     features: list,
@@ -312,325 +346,323 @@ def estimate_ic_signs(
     return pd.Series(signs)
 
 
-# ── TA-FDR for one track ──────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════
+# v3 — recentred joint bootstrap
+# ═════════════════════════════════════════════════════════════════════════
 
-def run_ta_fdr_track(
-    track: str,
-    target_col: str,
-    features: list,
-    feat_df: pd.DataFrame,
-    ohlcv: pd.DataFrame,
-    cfg: dict,
-    B: int,
-    rng: np.random.Generator,
-    block_length: int = BLOCK_LEN,
-    save_null: bool = False,
-) -> tuple:
-    """Returns (result_df, null_records).
+def orientation_signs(fdr_df: pd.DataFrame, track: str, features: list) -> pd.Series:
+    """sign(ic_bar) per feature for `track`, from fdr_results.parquet.
 
-    Joint null design (stationary block bootstrap):
-    --------------------------------------------------
-    For each draw b in 1..B:
-      1. Draw ONE shared date-index resample via the stationary block bootstrap
-         with geometric mean block length = block_length days.
-      2. Apply the SAME resampled date ordering to the return matrix for ALL
-         features.  The feature/position arrays keep their original date order.
-         Pairing original-order signals with block-resampled returns breaks the
-         predictive relationship while preserving:
-           (a) cross-sectional dependence: entire columns (dates) move together
-           (b) per-ticker autocorrelation: contiguous blocks maintain local
-               time-series structure
-      3. Recompute net = pos * resampled_ret - costs.  Costs are fixed because
-         turnover depends only on positions, not on realised returns.
-      4. T_f^(b) = mean(net_b)  — the same statistic as observed.
+    +1.0 if the feature is missing from that track's rows, or ic_bar is 0/NaN.
     """
-    log(f"\n  === Track: {track.upper()} ===")
-
-    spread_bps       = cfg["spread_bps"]
-    impact_coeff     = cfg["impact_coeff"]
-    aum_dollars      = cfg.get("aum_dollars", 1e8)
-    min_adv_dollars  = cfg.get("min_adv_dollars", 1e6)
-
-    all_tickers = feat_df.index.get_level_values("ticker").unique().tolist()
-    returns, sigma, adv = load_ohlcv_matrices(ohlcv, all_tickers, IS_START, IS_END)
-
-    log(f"  Estimating IC signs on IS data ...")
-    ic_signs = estimate_ic_signs(feat_df, features, target_col, IS_START, IS_END)
-
-    # --- Observed T_f (mean net return) + pre-compute positions/costs ---
-    log(f"  Computing observed T_f (mean net return) + pre-computing components "
-        f"for {len(features)} features ...")
-    t_obs  = {}
-    comps  = {}   # feat -> (pos_arr, ret_arr, costs_arr)
-
-    for i, feat in enumerate(features):
-        sig = build_single_feature_signal(feat_df, feat, ic_signs[feat], IS_START, IS_END)
-        c = _precompute_pnl_components(
-            sig, returns, sigma, adv,
-            spread_bps=spread_bps, impact_coeff=impact_coeff,
-            aum_dollars=aum_dollars, min_adv_dollars=min_adv_dollars,
-        )
-        if c is not None:
-            pos_, ret_, costs_ = c
-            comps[feat] = (pos_, ret_, costs_)
-            # T_f = mean net return (NOT Sharpe — see module docstring)
-            t_obs[feat] = _compute_mean_net_return(pos_, ret_, costs_)
-        else:
-            t_obs[feat] = np.nan
-        if (i+1) % 5 == 0:
-            log(f"    {i+1}/{len(features)} done")
-
-    valid_t = [v for v in t_obs.values() if not np.isnan(v)]
-    if valid_t:
-        log(f"  Observed T_f (mean net return) range: "
-            f"[{min(valid_t):+.6f}, {max(valid_t):+.6f}]")
-
-    # --- Joint null: stationary block bootstrap on the returns panel ---
-    log(f"\n  Running {B} joint stationary-block-bootstrap draws "
-        f"(block_length={block_length}) ...")
-    null_dist    = {feat: [] for feat in features}
-    null_records = []
-
-    # Determine T from the first available component's returns array
-    T_common = None
+    sub = fdr_df.loc[fdr_df["track"] == track].set_index("feature")["ic_bar"]
+    signs = {}
     for feat in features:
-        if feat in comps:
-            T_common = comps[feat][1].shape[0]
-            break
-
-    if T_common is None:
-        log("  WARNING: No valid components — skipping null.")
-        T_common = 0
-
-    t_perm_start = time.time()
-    for b in range(B):
-        # Draw ONE shared date resample for this draw (joint across all features)
-        date_idx = _draw_stationary_block_bootstrap_indices(T_common, block_length, rng)
-
-        perm_row = {}
-        for feat, (pos_, ret_, costs_) in comps.items():
-            # Apply the SAME resampled date ordering to the return array
-            # Positions and costs remain in their original (unchanged) date order
-            ret_b = ret_[date_idx, :]           # (T x N) resampled returns
-            # Costs are fixed (depend on position turnover, not realised returns)
-            net_b = (pos_ * ret_b).sum(axis=1) - costs_
-            t_b   = float(net_b.mean())
-            null_dist[feat].append(t_b)
-            perm_row[feat] = t_b
-
-        for feat in features:
-            if feat not in comps:
-                null_dist[feat].append(np.nan)
-
-        if save_null:
-            null_records.append({"track": track, "perm": b, **perm_row})
-
-        if (b+1) % 100 == 0:
-            elapsed = time.time() - t_perm_start
-            eta     = elapsed / (b+1) * (B - b - 1)
-            log(f"    draw {b+1}/{B}  elapsed={elapsed:.0f}s  ETA={eta:.0f}s")
-
-    # --- p-values, BH, and BHY ---
-    p_vals = {}
-    for feat in features:
-        null = np.array([v for v in null_dist[feat] if not np.isnan(v)])
-        t_f  = t_obs[feat]
-        if np.isnan(t_f) or len(null) == 0:
-            p_vals[feat] = 1.0
+        if feat not in sub.index:
+            signs[feat] = 1.0
+            continue
+        ic_bar = sub.loc[feat]
+        if pd.isna(ic_bar) or ic_bar == 0:
+            signs[feat] = 1.0
         else:
-            p_vals[feat] = (1 + (null >= t_f).sum()) / (1 + len(null))
-
-    p_arr  = np.array([p_vals[f] for f in features])
-    bh_reject, bh_adj_p   = benjamini_hochberg(p_arr, q=FDR_Q)
-    bhy_reject, bhy_adj_p = bhy_procedure(p_arr, q=FDR_Q)
-
-    # Load IC-based BH results for comparison (may not exist in test env)
-    bh_rej_set = set()
-    if FDR_PATH.exists():
-        bh_rej = pd.read_parquet(FDR_PATH)
-        bh_rej_set = set(
-            bh_rej[(bh_rej["track"] == track) & bh_rej["bh_rejected"]]["feature"].tolist()
-        )
-
-    result_df = pd.DataFrame({
-        "track":             track,
-        "feature":           features,
-        "T_obs":             [t_obs[f] for f in features],
-        "p_perm":            [p_vals[f] for f in features],
-        "bh_adj_p":          bh_adj_p,
-        "bhy_adj_p":         bhy_adj_p,
-        "bh_selected":       bh_reject,
-        "bhy_selected":      bhy_reject,
-        # Legacy column name kept for downstream compatibility
-        "ta_fdr_rejected":   bh_reject,
-        "bh_on_ic_rejected": [f in bh_rej_set for f in features],
-    })
-
-    n_bh  = result_df["bh_selected"].sum()
-    n_bhy = result_df["bhy_selected"].sum()
-    n_bh_ic = result_df["bh_on_ic_rejected"].sum()
-    log(f"\n  BH TA-FDR selected:  {n_bh}/{len(features)}")
-    log(f"  BHY TA-FDR selected: {n_bhy}/{len(features)}")
-    log(f"  BH-on-IC selected:   {n_bh_ic}/{len(features)}")
-
-    bh_set  = set(result_df[result_df["bh_selected"]]["feature"])
-    bhy_set = set(result_df[result_df["bhy_selected"]]["feature"])
-    only_bh  = sorted(bh_set - bh_rej_set)
-    only_bh_ic = sorted(bh_rej_set - bh_set)
-    in_both  = sorted(bh_set & bh_rej_set)
-    log(f"\n  In both BH-TA-FDR and BH-on-IC: {in_both}")
-    log(f"  Only BH-TA-FDR (tradable, cost-penalised): {only_bh}")
-    log(f"  Only BH-on-IC (stat signal, not tradable net-of-cost): {only_bh_ic}")
-    log(f"  BHY TA-FDR set: {sorted(bhy_set)}")
-
-    # --- Record to manifest ---
-    _record_to_manifest(track, features, t_obs, p_vals, bh_reject, bhy_reject,
-                        B, block_length)
-
-    null_df = pd.DataFrame(null_records) if null_records else pd.DataFrame()
-    return result_df, null_df
+            signs[feat] = float(np.sign(ic_bar))
+    return pd.Series(signs)
 
 
-def _record_to_manifest(
-    track: str,
-    features: list,
-    t_obs: dict,
-    p_vals: dict,
-    bh_reject: np.ndarray,
-    bhy_reject: np.ndarray,
+def _bartlett_hac_var_of_mean(x: np.ndarray, maxlags: int) -> np.ndarray:
+    """Newey-West (Bartlett-kernel) HAC variance of the sample mean.
+
+    Operates along the LAST axis: `x` may be 1D (T,) -> returns a 0-d array
+    (usable as a scalar), or 2D (B, T) -> returns a (B,) array (one HAC
+    variance per row). Shared by `_newey_west_t` (single observed series) and
+    `compute_bootstrap_pvalues` (batched over every bootstrap replicate, as a
+    fast closed-form stand-in for a per-draw nested/double bootstrap).
+    """
+    x = np.asarray(x, dtype=float)
+    T = x.shape[-1]
+    demeaned = x - x.mean(axis=-1, keepdims=True)
+    L = min(maxlags, T - 1)
+    total = np.mean(demeaned ** 2, axis=-1)
+    for k in range(1, L + 1):
+        w = 1.0 - k / (maxlags + 1)          # Bartlett kernel weight
+        gamma_k = np.mean(demeaned[..., :-k] * demeaned[..., k:], axis=-1)
+        total = total + 2.0 * w * gamma_k
+    return np.maximum(total, 1e-300) / T
+
+
+def _newey_west_t(x: np.ndarray, maxlags: int = 21) -> float:
+    """HAC t-statistic for H0: mean(x) = 0 (Bartlett kernel, fixed maxlags —
+    default 21 per spec: 'nw_t_net (Newey-West, 21 lags)')."""
+    x = np.asarray(x, dtype=float)
+    se = float(np.sqrt(_bartlett_hac_var_of_mean(x, maxlags)))
+    if se < 1e-15:
+        return 0.0
+    return float(x.mean() / se)
+
+
+def compute_bootstrap_pvalues(
+    gross_pnl: dict,
+    total_cost: dict,
     B: int,
     block_length: int,
-) -> None:
-    """Record per-feature stats and joint-null parameters to the manifest."""
-    try:
-        # Record joint-null parameters (once per track)
-        manifest_record(
-            f"ta_fdr.{track}.null_params",
-            {"null": "stationary_block_bootstrap_JOINT",
-             "block_length_days": block_length,
-             "n_samples": B,
-             "statistic": "mean_net_return",
-             "preserves": ["ticker_autocorrelation", "cross_sectional_dependence"]},
-            stage="ta_fdr",
-            track=track,
-            meta={"description": "Joint null parameters for TA-FDR permutation test"},
-        )
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Joint stationary-block-bootstrap null for TA-FDR v3, decoupled from I/O.
 
-        # Record per-feature statistics
-        per_feature = []
-        for i, feat in enumerate(features):
-            per_feature.append({
-                "feature":      feat,
-                "t_obs":        float(t_obs[feat]) if not np.isnan(t_obs[feat]) else None,
-                "p_value":      float(p_vals[feat]),
-                "bh_selected":  bool(bh_reject[i]),
-                "bhy_selected": bool(bhy_reject[i]),
-            })
+    For each feature f with daily gross P&L g_f (T,) and daily total cost c_f
+    (T,):
+        T_obs      = mean(g_f) - mean(c_f)          # observed net statistic
+        mean_gross = mean(g_f)
+        mean_cost  = mean(c_f)
 
-        manifest_record(
-            f"ta_fdr.{track}.per_feature",
-            per_feature,
-            stage="ta_fdr",
-            track=track,
-            meta={"statistic": "mean_net_return",
-                  "null": "stationary_block_bootstrap_JOINT"},
-        )
+    ONE shared (B, T) index matrix is drawn via
+    `_draw_stationary_block_bootstrap_indices` (called B times; the SAME
+    index matrix is reused across every feature passed in this call, which is
+    what makes the null "joint": cross-feature dependence in the resampled
+    panel is preserved because every feature is resampled along the identical
+    date permutation for a given draw b).
 
-        n_bh  = int(bh_reject.sum())
-        n_bhy = int(bhy_reject.sum())
-        manifest_record(
-            f"ta_fdr.{track}.summary",
-            {"n_features": len(features),
-             "n_bh_selected": n_bh,
-             "n_bhy_selected": n_bhy},
-            stage="ta_fdr",
-            track=track,
-        )
-    except Exception as e:
-        log(f"  WARNING: manifest record failed: {e}")
+    For each feature, vectorised over draws (no Python loop over b):
+        resampled_b = g_f[idx_matrix]                       # (B, T)
+        D_b         = resampled_b.mean(axis=1) - mean_gross  # (B,) recentred
+
+        p_net   = (1 + #{b: D_b >= T_obs})        / (1 + B)
+        p_gross = (1 + #{b: D_b >= mean_gross})   / (1 + B)   # same D_b draws
+
+    Since T_obs <= mean_gross (cost >= 0) and the exceedance count is
+    non-increasing in the threshold, p_net >= p_gross ALWAYS — this is exactly
+    `pval_antitone` / `tafdr_conservative` from formal/CavalFormal/TAFdr.lean.
+    Asserted (raises AssertionError, naming the feature and both p-values, if
+    ever violated) for every feature before returning.
+
+    Studentised bootstrap-t robustness check:
+        se_boot = std(D_b, ddof=1)     # bootstrap sd of D — if < 1e-15, set
+                                        # t_stat=0.0, p_stud=1.0 and skip
+        t_stat  = T_obs / se_boot
+        Per-draw denominator se_boot^(b): a proper double (nested) bootstrap
+        is too slow for B up to 2000 x 30 features x 2 tracks, so this uses a
+        closed-form stationary-bootstrap HAC-type (Newey-West, Bartlett
+        kernel, maxlags=block_length) standard error of the mean, computed
+        directly on each draw's resampled series `resampled_b[b, :]` (no
+        further resampling) — see `_bartlett_hac_var_of_mean`, vectorised
+        over all B draws at once.
+        t_b    = D_b / max(se_boot^(b), 1e-12)
+        p_stud = (1 + #{b: t_b >= t_stat}) / (1 + B)
+
+    Returns
+    -------
+    pd.DataFrame indexed by feature (same key order as `gross_pnl`) with
+    columns: T_obs, mean_gross, mean_cost, p_net, p_gross, se_boot, t_stat,
+    p_stud, null_mean_D, null_sd_D.
+
+    Raises
+    ------
+    ValueError
+        If `gross_pnl` and `total_cost` do not share the same feature keys,
+        or if the per-feature arrays are not all the same length T.
+    """
+    features = list(gross_pnl.keys())
+    if set(total_cost.keys()) != set(gross_pnl.keys()):
+        raise ValueError("gross_pnl and total_cost must have the same feature keys")
+
+    lengths = {len(np.asarray(v)) for v in gross_pnl.values()}
+    if len(lengths) != 1:
+        raise ValueError(f"All gross_pnl arrays must share one length T; got {lengths}")
+    T = lengths.pop()
+    for feat in features:
+        if len(np.asarray(total_cost[feat])) != T:
+            raise ValueError(
+                f"total_cost[{feat!r}] length {len(total_cost[feat])} != T={T}"
+            )
+
+    idx_matrix = np.empty((B, T), dtype=np.intp)
+    for b in range(B):
+        idx_matrix[b] = _draw_stationary_block_bootstrap_indices(T, block_length, rng)
+
+    rows = {}
+    for feat in features:
+        g = np.asarray(gross_pnl[feat], dtype=float)
+        c = np.asarray(total_cost[feat], dtype=float)
+        mean_gross = float(g.mean())
+        mean_cost  = float(c.mean())
+        T_obs      = mean_gross - mean_cost
+
+        resampled = g[idx_matrix]                        # (B, T)
+        D = resampled.mean(axis=1) - mean_gross           # (B,) recentred null
+
+        p_net   = (1 + int(np.sum(D >= T_obs)))   / (1 + B)
+        p_gross = (1 + int(np.sum(D >= mean_gross))) / (1 + B)
+        if p_net < p_gross - 1e-9:
+            raise AssertionError(
+                f"p_net ({p_net:.6f}) < p_gross ({p_gross:.6f}) for feature "
+                f"{feat!r}; this violates pval_antitone / tafdr_conservative "
+                "(formal/CavalFormal/TAFdr.lean) and must never happen when "
+                "T_obs <= mean_gross (costs >= 0)."
+            )
+
+        se_boot = float(D.std(ddof=1)) if B > 1 else 0.0
+        if se_boot < 1e-15:
+            t_stat = 0.0
+            p_stud = 1.0
+        else:
+            t_stat = T_obs / se_boot
+            se_b = np.sqrt(_bartlett_hac_var_of_mean(resampled, block_length))  # (B,)
+            t_b  = D / np.maximum(se_b, 1e-12)
+            p_stud = (1 + int(np.sum(t_b >= t_stat))) / (1 + B)
+
+        rows[feat] = {
+            "T_obs":       T_obs,
+            "mean_gross":  mean_gross,
+            "mean_cost":   mean_cost,
+            "p_net":       p_net,
+            "p_gross":     p_gross,
+            "se_boot":     se_boot,
+            "t_stat":      t_stat,
+            "p_stud":      p_stud,
+            "null_mean_D": float(D.mean()),
+            "null_sd_D":   float(D.std(ddof=1)) if B > 1 else 0.0,
+        }
+
+    return pd.DataFrame.from_dict(rows, orient="index")[[
+        "T_obs", "mean_gross", "mean_cost", "p_net", "p_gross",
+        "se_boot", "t_stat", "p_stud", "null_mean_D", "null_sd_D",
+    ]]
 
 
-# ── OOS rerun comparison ──────────────────────────────────────────────────────
-
-def run_oos_comparison(
-    ta_fdr_df: pd.DataFrame,
+def run_ta_fdr_v3_track(
+    track: str,
+    features: list,
     feat_df: pd.DataFrame,
+    fdr_df: pd.DataFrame,
     ohlcv: pd.DataFrame,
     cfg: dict,
-) -> pd.DataFrame:
-    """Compare OOS 2022-2024 performance: TA-FDR set vs static-BH set."""
-    from src.backtest.generate_signals import build_signal_weights, generate_composite_signal
-    fdr_df  = pd.read_parquet(FDR_PATH)
-    shap_df = pd.read_parquet(SHAP_PATH)
+    sim: PortfolioSimulator,
+    B: int,
+    block_length: int,
+    rng: np.random.Generator,
+) -> tuple:
+    """Run TA-FDR v3 for one track. Returns (result_df, null_summary_df)."""
+    log(f"\n  === Track: {track.upper()} ===")
 
-    sim = PortfolioSimulator(
-        config_path=str(CFG_PATH),
-        spread_bps=cfg["spread_bps"],
-        impact_coeff=cfg["impact_coeff"],
+    all_tickers = feat_df.index.get_level_values("ticker").unique().tolist()
+    panel = books.load_market_panel(ohlcv, all_tickers, IS_START, IS_END)
+    signs = orientation_signs(fdr_df, track, features)
+
+    log(f"  Building {len(features)} single-feature books (rebal_freq={REBAL_FREQ}) ...")
+    book_dict = {}
+    for i, feat in enumerate(features):
+        book_dict[feat] = books.single_feature_book(
+            feat_df, feat, signs[feat], panel, sim,
+            rebal_freq=REBAL_FREQ, start=IS_START, end=IS_END,
+        )
+        if (i + 1) % 5 == 0:
+            log(f"    {i+1}/{len(features)} books built")
+
+    first_feat = features[0]
+    first_index = book_dict[first_feat].index
+    for feat, book in book_dict.items():
+        if not book.index.equals(first_index):
+            raise AssertionError(
+                f"Feature {feat!r}'s book date index ({len(book)} rows) does "
+                f"not match {first_feat!r}'s shared grid ({len(first_index)} "
+                "rows) — the joint bootstrap requires every feature to share "
+                "one date index."
+            )
+    T = len(first_index)
+    log(f"  Shared date grid: {T} trading days ({IS_START} -> {IS_END})")
+
+    gross_pnl  = {f: book_dict[f]["gross_pnl"].to_numpy()  for f in features}
+    total_cost = {f: book_dict[f]["total_cost"].to_numpy() for f in features}
+
+    log(f"  Running {B} joint stationary-block-bootstrap draws "
+        f"(block_length={block_length}) ...")
+    t_boot = time.time()
+    boot_df = compute_bootstrap_pvalues(
+        gross_pnl, total_cost, B=B, block_length=block_length, rng=rng,
     )
+    log(f"  Bootstrap complete in {time.time() - t_boot:.1f}s")
 
-    records = []
+    ann_net_sharpe = {}
+    nw_t_net = {}
+    for feat in features:
+        metrics = sim.compute_metrics(book_dict[feat])
+        ann_net_sharpe[feat] = metrics["net_pnl_sharpe"]
+        nw_t_net[feat] = _newey_west_t(book_dict[feat]["net_pnl"].to_numpy(), maxlags=21)
 
-    for track in ["track_a", "track_b"]:
-        sub_ta = ta_fdr_df[ta_fdr_df["track"] == track]
+    bh_net,    bh_net_adj    = benjamini_hochberg(boot_df["p_net"].to_numpy(),   q=FDR_Q)
+    bhy_net,   bhy_net_adj   = bhy_procedure(boot_df["p_net"].to_numpy(),        q=FDR_Q)
+    bh_gross,  bh_gross_adj  = benjamini_hochberg(boot_df["p_gross"].to_numpy(), q=FDR_Q)
+    bhy_gross, bhy_gross_adj = bhy_procedure(boot_df["p_gross"].to_numpy(),      q=FDR_Q)
+    bh_stud,   bh_stud_adj   = benjamini_hochberg(boot_df["p_stud"].to_numpy(),  q=FDR_Q)
+    bhy_stud,  bhy_stud_adj  = bhy_procedure(boot_df["p_stud"].to_numpy(),       q=FDR_Q)
 
-        for method, use_ta in [("static_bh", False), ("ta_fdr", True)]:
-            if use_ta:
-                # Build weights using BH TA-FDR feature set + IC signs from observed T_f
-                ta_feats = sub_ta[sub_ta["bh_selected"]]["feature"].tolist()
-                if not ta_feats:
-                    log(f"  [{track}] TA-FDR selected 0 features — skipping OOS for ta_fdr")
-                    continue
-                bh_sub   = fdr_df[fdr_df["track"] == track].set_index("feature")
-                shap_avg = shap_df[shap_df["track"] == track].groupby("feature")["mean_abs_shap"].mean()
-                w = {}
-                for f in ta_feats:
-                    sign = float(np.sign(bh_sub.loc[f, "ic_bar"])) if f in bh_sub.index else 1.0
-                    w[f] = sign * float(shap_avg.get(f, shap_avg.mean()))
-                ws = pd.Series(w)
-                ws = ws / ws.abs().sum()
-                sig = generate_composite_signal(feat_df, ws, HOLDOUT_START, HOLDOUT_END)
-            else:
-                try:
-                    weights = build_signal_weights(track, fdr_df, shap_df)
-                except ValueError:
-                    log(f"  [{track}] no BH-selected features — skipping OOS for static_bh")
-                    continue
-                sig = generate_composite_signal(feat_df, weights, HOLDOUT_START, HOLDOUT_END)
+    result_df = pd.DataFrame({
+        "track":              track,
+        "feature":            features,
+        "sign":               [signs[f] for f in features],
+        "mean_gross":         boot_df["mean_gross"].to_numpy(),
+        "mean_cost":          boot_df["mean_cost"].to_numpy(),
+        "mean_net":           boot_df["T_obs"].to_numpy(),
+        "ann_net_sharpe":     [ann_net_sharpe[f] for f in features],
+        "nw_t_net":           [nw_t_net[f] for f in features],
+        "p_net":              boot_df["p_net"].to_numpy(),
+        "p_gross":            boot_df["p_gross"].to_numpy(),
+        "p_stud":             boot_df["p_stud"].to_numpy(),
+        "bh_net_selected":    bh_net,
+        "bh_net_adj_p":       bh_net_adj,
+        "bhy_net_selected":   bhy_net,
+        "bhy_net_adj_p":      bhy_net_adj,
+        "bh_gross_selected":  bh_gross,
+        "bh_gross_adj_p":     bh_gross_adj,
+        "bhy_gross_selected": bhy_gross,
+        "bhy_gross_adj_p":    bhy_gross_adj,
+        "bh_stud_selected":   bh_stud,
+        "bh_stud_adj_p":      bh_stud_adj,
+        "bhy_stud_selected":  bhy_stud,
+        "bhy_stud_adj_p":     bhy_stud_adj,
+    })
 
-            tickers = sig.columns.tolist()
-            mask = (
-                ohlcv["ticker"].isin(tickers)
-                & (ohlcv["date"] >= pd.Timestamp(HOLDOUT_START))
-                & (ohlcv["date"] <= pd.Timestamp(HOLDOUT_END))
-            )
-            sub_ohlcv = ohlcv[mask][["ticker","date","close","volume"]]
-            close_w   = sub_ohlcv.pivot(index="date", columns="ticker", values="close")
-            vol_w     = sub_ohlcv.pivot(index="date", columns="ticker", values="volume")
-            returns   = close_w.pct_change()
-            sigma     = returns.rolling(VOL_WINDOW, min_periods=10).std()
-            adv       = (close_w * vol_w).rolling(VOL_WINDOW, min_periods=10).mean()
-            ret_mask  = (returns.index >= pd.Timestamp(HOLDOUT_START)) & \
-                        (returns.index <= pd.Timestamp(HOLDOUT_END))
-            returns   = returns[ret_mask]
-            sigma     = sigma[ret_mask]
-            adv       = adv[ret_mask]
+    null_summary_df = pd.DataFrame({
+        "track":        track,
+        "feature":      features,
+        "null_mean_D":  boot_df["null_mean_D"].to_numpy(),
+        "null_sd_D":    boot_df["null_sd_D"].to_numpy(),
+        "B":            B,
+        "block_length": block_length,
+    })
 
-            positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
-            pnl_df    = sim.simulate_pnl(
-                positions, returns, vol=sigma, adv_dollars=adv,
-                aum_dollars=cfg.get("aum_dollars", 1e8),
-                min_adv_dollars=cfg.get("min_adv_dollars", 1e6),
-            )
-            m = sim.compute_metrics(pnl_df)
-            records.append({"track": track, "method": method, **m})
+    n_bh_net,    n_bhy_net    = int(bh_net.sum()),    int(bhy_net.sum())
+    n_bh_gross,  n_bhy_gross  = int(bh_gross.sum()),  int(bhy_gross.sum())
+    n_bh_stud,   n_bhy_stud   = int(bh_stud.sum()),   int(bhy_stud.sum())
+    log(f"  BH/BHY selected (net):   {n_bh_net}/{len(features)}  /  {n_bhy_net}/{len(features)}")
+    log(f"  BH/BHY selected (gross): {n_bh_gross}/{len(features)}  /  {n_bhy_gross}/{len(features)}")
+    log(f"  BH/BHY selected (stud):  {n_bh_stud}/{len(features)}  /  {n_bhy_stud}/{len(features)}")
 
-            log(f"  [{track}] {method}: net SR = {m.get('net_pnl_sharpe', float('nan')):+.3f}")
+    top = result_df.sort_values("p_net").head(10)
+    log("\n  Top 10 by p_net:")
+    for _, row in top.iterrows():
+        log(f"    {row['feature']:<28s} sign={row['sign']:+.0f}  "
+            f"mean_net={row['mean_net']:+.6f}  p_net={row['p_net']:.4f}  "
+            f"p_gross={row['p_gross']:.4f}  p_stud={row['p_stud']:.4f}  "
+            f"BH_net={bool(row['bh_net_selected'])}")
 
-    return pd.DataFrame(records)
+    return result_df, null_summary_df
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+def _rename_v2_output(path: Path) -> None:
+    """Rename a v2 (invalid-null) output out of the way, without clobbering."""
+    if not path.exists():
+        log(f"  [rename] {path} does not exist — nothing to rename")
+        return
+    target = path.with_name(path.name + ".v2_invalid_null")
+    if target.exists():
+        log(f"  [rename] {target} already exists — leaving {path} in place")
+        return
+    path.rename(target)
+    log(f"  [rename] {path} -> {target}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -640,22 +672,21 @@ def main():
                         help="Mean block length for stationary bootstrap (default from spec.yaml)")
     parser.add_argument("--tracks", nargs="+", default=["track_b", "track_a"],
                         choices=["track_a", "track_b"])
-    parser.add_argument("--save-null", action="store_true", default=False)
     args = parser.parse_args()
 
-    log(f"=== Tradable-Alpha FDR (TA-FDR) — B={args.B}, "
-        f"block_length={args.block_length} (stationary bootstrap) ===\n")
+    log(f"=== Tradable-Alpha FDR (TA-FDR) v3 — B={args.B}, "
+        f"block_length={args.block_length} (recentred joint bootstrap) ===\n")
     t0  = time.time()
     rng = np.random.default_rng(args.seed)
 
     with open(CFG_PATH) as f:
         cfg = yaml.safe_load(f)
 
+    _rename_v2_output(OLD_TAFDR_PATH)
+    _rename_v2_output(OLD_OOS_PATH)
+
     log("\nLoading feature data to determine feature set ...")
     feat_df = pd.read_parquet(FEAT_PATH)
-
-    # Use feature_spec.feature_columns — canonical pre-registered set
-    # (drops dropped_broadcast and dropped_duplicates; includes KEPT + ADDED_INTERACTIONS)
     features = get_feature_columns(feat_df)
     log(f"  Features from feature_spec: {len(features)}")
     log(f"  IS period: {IS_START} -> {IS_END}")
@@ -664,45 +695,68 @@ def main():
     log("\nLoading OHLCV data ...")
     ohlcv = pd.read_parquet(OHLCV_PATH)
 
-    track_targets = {"track_a": "target_track_a", "track_b": "target_track_b"}
+    log("\nLoading fdr_results.parquet (for orientation signs) ...")
+    fdr_df = pd.read_parquet(FDR_PATH)
+
+    sim = PortfolioSimulator(
+        config_path=str(CFG_PATH),
+        spread_bps=cfg["spread_bps"],
+        impact_coeff=cfg["impact_coeff"],
+    )
 
     all_results = []
     all_nulls   = []
+    per_track_summary = {}
 
     for track in args.tracks:
-        result_df, null_df = run_ta_fdr_track(
-            track, track_targets[track],
-            features, feat_df, ohlcv, cfg,
-            B=args.B, rng=rng,
-            block_length=args.block_length,
-            save_null=args.save_null,
+        result_df, null_summary_df = run_ta_fdr_v3_track(
+            track, features, feat_df, fdr_df, ohlcv, cfg, sim,
+            B=args.B, block_length=args.block_length, rng=rng,
         )
         all_results.append(result_df)
-        all_nulls.append(null_df)
+        all_nulls.append(null_summary_df)
+        per_track_summary[track] = {
+            "n_features":  len(features),
+            "n_bh_net":    int(result_df["bh_net_selected"].sum()),
+            "n_bhy_net":   int(result_df["bhy_net_selected"].sum()),
+            "n_bh_gross":  int(result_df["bh_gross_selected"].sum()),
+            "n_bhy_gross": int(result_df["bhy_gross_selected"].sum()),
+            "n_bh_stud":   int(result_df["bh_stud_selected"].sum()),
+            "n_bhy_stud":  int(result_df["bhy_stud_selected"].sum()),
+        }
 
-    ta_fdr_df = pd.concat(all_results, ignore_index=True)
-    ta_fdr_df.to_parquet(OUT_TAFDR, index=False)
-    log(f"\nSaved -> {OUT_TAFDR}")
+    ta_fdr_v3_df    = pd.concat(all_results, ignore_index=True)
+    null_summary_df = pd.concat(all_nulls, ignore_index=True)
 
-    if args.save_null:
-        null_full = pd.concat(all_nulls, ignore_index=True)
-        null_full.to_parquet(OUT_NULL, index=False)
-        log(f"Saved null distributions -> {OUT_NULL}")
+    ta_fdr_v3_df.to_parquet(OUT_TAFDR_V3, index=False)
+    log(f"\nSaved -> {OUT_TAFDR_V3}")
+    null_summary_df.to_parquet(OUT_NULL_V3, index=False)
+    log(f"Saved -> {OUT_NULL_V3}")
 
-    log("\n=== OOS comparison: static-BH vs TA-FDR set ===")
-    oos_df = run_oos_comparison(ta_fdr_df, feat_df, ohlcv, cfg)
-    oos_df.to_parquet(OUT_OOS, index=False)
-    log(f"Saved -> {OUT_OOS}")
+    elapsed = time.time() - t0
+    summary = {
+        "B":               args.B,
+        "block_length":    args.block_length,
+        "seed":            args.seed,
+        "is_start":        IS_START,
+        "is_end":          IS_END,
+        "fdr_q":           FDR_Q,
+        "elapsed_seconds": elapsed,
+        "tracks":          per_track_summary,
+        "generated_at":    datetime.now(timezone.utc).isoformat(),
+    }
+    OUT_SUMMARY_JSON.parent.mkdir(parents=True, exist_ok=True)
+    OUT_SUMMARY_JSON.write_text(json.dumps(summary, indent=2) + "\n")
+    log(f"Saved -> {OUT_SUMMARY_JSON}")
 
     log("\n=== SUMMARY ===")
     for track in args.tracks:
-        sub = ta_fdr_df[ta_fdr_df["track"] == track]
-        n_bh  = sub["bh_selected"].sum()
-        n_bhy = sub["bhy_selected"].sum()
-        n_ic  = sub["bh_on_ic_rejected"].sum()
-        log(f"  {track.upper()}: BH-TA-FDR={n_bh}  BHY-TA-FDR={n_bhy}  BH-on-IC={n_ic}")
+        s = per_track_summary[track]
+        log(f"  {track.upper()}: BH_net={s['n_bh_net']}  BHY_net={s['n_bhy_net']}  "
+            f"BH_gross={s['n_bh_gross']}  BHY_gross={s['n_bhy_gross']}  "
+            f"BH_stud={s['n_bh_stud']}  BHY_stud={s['n_bhy_stud']}")
 
-    log(f"\nTotal elapsed: {time.time()-t0:.1f}s")
+    log(f"\nTotal elapsed: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":

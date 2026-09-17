@@ -132,7 +132,10 @@ def aci_coverage(cal_resid, te_dates, test_resid, gamma=GAMMA):
 def main():
     log("=== E1: Adaptive Conformal Inference (Gibbs-Candes 2021) ===\n")
     t0 = time.time()
-    df = pd.read_parquet(FEAT_PATH)
+    # Lean load: frozen-specification columns only (683 MB panel, 8 GB machine).
+    from src.data.lean_load import load_features_lean
+
+    df = load_features_lean(FEAT_PATH)
     folds = make_fold_dates()
 
     rows = []

@@ -1,7 +1,8 @@
 """tests/test_screen0_no_lookahead.py — No-look-ahead unit tests for screen0.py.
 
-All four tests use fully synthetic data (tiny in-memory DataFrames + toy CSVs
-written to a tmp directory).  No DuckDB, no network access, no parquet files.
+All tests use fully synthetic data (tiny in-memory DataFrames plus toy CSV or
+parquet membership files written to a tmp directory).  No DuckDB or network
+access is required.
 
 Run:
     python3 -m pytest tests/test_screen0_no_lookahead.py -v
@@ -24,6 +25,7 @@ from src.data.screen0 import (
     build_liquidity_universe,
     lagged_min_price,
     pit_membership_mask,
+    pit_membership_mask_daily,
     screen0_eligibility,
     trailing_adv_usd,
 )
@@ -70,6 +72,20 @@ def _write_snapshot_csv(tmp_path: Path, year: int, tickers: list[str]) -> None:
     rows = [{"Company": tkr, "Weight": 1.0, "Ticker": tkr} for tkr in tickers]
     df = pd.DataFrame(rows, columns=["Company", "Weight", "Ticker"])
     df.to_csv(tmp_path / f"{year}.csv", index=False)
+
+
+def _write_membership_daily_parquet(
+    tmp_path: Path,
+    rows: list[tuple[str, str]],
+) -> Path:
+    """Write a normalized, sorted [date, ticker] daily membership parquet."""
+    df = pd.DataFrame(rows, columns=["date", "ticker"])
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df["ticker"] = df["ticker"].astype("string")
+    df = df.sort_values(["date", "ticker"]).drop_duplicates(["date", "ticker"])
+    path = tmp_path / "membership_daily.parquet"
+    df.to_parquet(path, index=False)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -285,3 +301,147 @@ def test_liquidity_universe():
             n_members = int(row.sum())
             assert n_members == 2, \
                 f"Expected exactly 2 members on {d}, got {n_members}"
+
+
+# ---------------------------------------------------------------------------
+# Daily PIT membership: exact per-ticker one-row lag
+# ---------------------------------------------------------------------------
+
+def test_daily_pit_membership_exact_one_day_lag(tmp_path):
+    """A same-day member flag becomes usable only on the ticker's next row."""
+    dates = ["2021-01-04", "2021-01-05", "2021-01-06", "2021-01-07", "2021-01-08"]
+    daily = _make_daily(
+        ["A"], dates, {"A": [10.0] * 5}, {"A": [200_000.0] * 5}
+    )
+    membership_path = _write_membership_daily_parquet(
+        tmp_path,
+        [("2021-01-05", "A"), ("2021-01-07", "A")],
+    )
+
+    mask = pit_membership_mask_daily(daily, membership_path)
+    mask_a = mask.xs("A", level="ticker").sort_index()
+
+    expected = [False, False, True, False, True]
+    for date, is_member in zip(dates, expected):
+        assert bool(mask_a[pd.Timestamp(date)]) is is_member
+    assert mask.dtype == bool
+
+
+def test_daily_pit_membership_addition_is_lagged_symmetrically(tmp_path):
+    """An addition on D is absent on D and present from D+1."""
+    dates = ["2021-01-04", "2021-01-05", "2021-01-06", "2021-01-07"]
+    daily = _make_daily(
+        ["ADD"], dates, {"ADD": [10.0] * 4}, {"ADD": [200_000.0] * 4}
+    )
+    membership_path = _write_membership_daily_parquet(
+        tmp_path,
+        [(date, "ADD") for date in dates[1:]],
+    )
+
+    mask = pit_membership_mask_daily(daily, membership_path)
+    add_mask = mask.xs("ADD", level="ticker").sort_index()
+
+    expected = [False, False, True, True]
+    for date, is_member in zip(dates, expected):
+        assert bool(add_mask[pd.Timestamp(date)]) is is_member
+
+
+def test_daily_pit_membership_removal_is_lagged_symmetrically(tmp_path):
+    """A removal after D remains eligible on D+1 and appears on D+2."""
+    dates = ["2021-01-04", "2021-01-05", "2021-01-06", "2021-01-07", "2021-01-08"]
+    daily = _make_daily(
+        ["REMOVE"], dates, {"REMOVE": [10.0] * 5}, {"REMOVE": [200_000.0] * 5}
+    )
+    membership_path = _write_membership_daily_parquet(
+        tmp_path,
+        [(date, "REMOVE") for date in dates[:3]],
+    )
+
+    mask = pit_membership_mask_daily(daily, membership_path)
+    remove_mask = mask.xs("REMOVE", level="ticker").sort_index()
+
+    # Same-day membership is T,T,T,F,F, so its one-row lag is F,T,T,T,F.
+    expected = [False, True, True, True, False]
+    for date, is_member in zip(dates, expected):
+        assert bool(remove_mask[pd.Timestamp(date)]) is is_member
+
+
+def test_screen0_eligibility_daily_membership_end_to_end(tmp_path):
+    """Daily Screen 0 combines lagged membership with lagged price and ADV."""
+    dates = ["2021-01-04", "2021-01-05", "2021-01-06", "2021-01-07", "2021-01-08"]
+    daily = _make_daily(
+        ["A"],
+        dates,
+        {"A": [10.0, 4.0, 10.0, 10.0, 10.0]},
+        {"A": [200_000.0] * 5},
+    )
+    membership_path = _write_membership_daily_parquet(
+        tmp_path,
+        [(date, "A") for date in dates],
+    )
+
+    membership = pit_membership_mask_daily(daily, membership_path)
+    price_ok = lagged_min_price(daily) >= 5.0
+    adv_ok = trailing_adv_usd(daily, window=2) >= 1_000_000.0
+    expected = (membership & price_ok & adv_ok).rename("s0_eligible")
+
+    actual = screen0_eligibility(
+        daily,
+        sp500_dir=tmp_path,
+        min_price=5.0,
+        min_adv=1_000_000.0,
+        adv_window=2,
+        universe="pit",
+        granularity="daily",
+        membership_daily_path=membership_path,
+    )
+
+    pd.testing.assert_series_equal(actual, expected)
+    actual_a = actual.xs("A", level="ticker").sort_index()
+    assert [bool(actual_a[pd.Timestamp(date)]) for date in dates] == [
+        False, True, False, True, True
+    ]
+
+
+def test_screen0_default_granularity_preserves_annual_pit_behavior(tmp_path):
+    """Omitting granularity retains the established annual snapshot gate."""
+    dates_2020 = ["2020-12-29", "2020-12-30", "2020-12-31"]
+    dates_2021 = ["2021-01-04", "2021-01-05", "2021-01-06"]
+    all_dates = dates_2020 + dates_2021
+    daily = _make_daily(
+        ["C"], all_dates, {"C": [10.0] * 6}, {"C": [1e7] * 6}
+    )
+    _write_snapshot_csv(tmp_path, 2020, ["OTHER"])
+    _write_snapshot_csv(tmp_path, 2021, ["C"])
+
+    elig = screen0_eligibility(
+        daily,
+        sp500_dir=tmp_path,
+        min_price=5.0,
+        min_adv=0.0,
+        adv_window=2,
+        universe="pit",
+    )
+    elig_c = elig.xs("C", level="ticker").sort_index()
+
+    for date in dates_2020:
+        assert not elig_c[pd.Timestamp(date)]
+    for date in dates_2021:
+        assert elig_c[pd.Timestamp(date)]
+
+
+def test_screen0_rejects_bad_daily_granularity_inputs(tmp_path):
+    """Daily PIT needs its parquet path, and unknown granularities are invalid."""
+    dates = ["2021-01-04", "2021-01-05"]
+    daily = _make_daily(
+        ["A"], dates, {"A": [10.0, 10.0]}, {"A": [200_000.0, 200_000.0]}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="membership_daily_path is required when granularity='daily'",
+    ):
+        screen0_eligibility(daily, tmp_path, granularity="daily")
+
+    with pytest.raises(ValueError, match="granularity must be 'annual' or 'daily'"):
+        screen0_eligibility(daily, tmp_path, granularity="monthly")

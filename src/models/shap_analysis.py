@@ -89,11 +89,28 @@ def run_shap_analysis() -> pd.DataFrame:
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
 
-    df = pd.read_parquet(FEATURES_PATH)
+    # Lean load: modelled columns only, float32. The full 47-column float64
+    # panel drove this 8 GB machine into ~13 GB of swap on a nearly full volume.
+    # Results are unchanged: preprocess() selects its columns from feature_spec,
+    # so the dropped columns were never model inputs anyway.
+    import pyarrow.parquet as pq
+
+    from src.features.feature_spec import ADDED_INTERACTIONS, KEPT_FEATURES
+
+    available = set(pq.read_schema(FEATURES_PATH).names)
+    feat_cols = [c for c in list(KEPT_FEATURES) + list(ADDED_INTERACTIONS)
+                 if c in available]
+    target_cols = [c for c in ("target_track_a", "target_track_b") if c in available]
+
+    df = pd.read_parquet(FEATURES_PATH, columns=feat_cols + target_cols)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
     )
-    feat_cols  = [c for c in df.columns if not c.startswith("target")]
+    for col in df.columns:
+        if df[col].dtype == "float64":
+            df[col] = df[col].astype("float32")
+    print(f"  Loaded {df.shape} | {len(feat_cols)} features | "
+          f"{df.memory_usage(deep=True).sum() / 1e9:.2f} GB in memory")
     fold_dates = make_fold_dates()
 
     rng    = np.random.default_rng(SEED)

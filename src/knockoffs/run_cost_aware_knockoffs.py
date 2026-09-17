@@ -93,7 +93,7 @@ from src.features.feature_spec import feature_columns as _feature_columns
 
 FEATURES_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
 FDR_PATH       = ROOT / "data" / "processed" / "fdr_results.parquet"
-OHLCV_PATH     = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH     = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH       = ROOT / "configs" / "backtest.yaml"
 
 OUT_KNOCKOFFS  = ROOT / "data" / "processed" / "cak_knockoff_features.parquet"

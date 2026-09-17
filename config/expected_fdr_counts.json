@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "Accepted BH/BHY rejection counts on the v3 daily-PIT panel, spec v3.0.",
+    "These are a property of THIS panel, not an invariant: the Array-era values",
+    "(track_a 12/11, track_b 0/0) were hard-coded in run_search_adjusted_fdr.py",
+    "and turned a legitimate universe rebuild into a crash. Counts live here so",
+    "that unintended drift trips a wire while a deliberate change is a one-line",
+    "edit with a reason.",
+    "Updated 2026-09-16 after two feature-basis fixes. The tripwire fired on",
+    "track_a BHY 11 -> 12, which is the intended behaviour: the change is real.",
+    "Updated 2026-09-17 after the corr_* source fix. The tripwire fired on",
+    "track_a BHY 12 -> 13, which is the intended behaviour: the change is real.",
+    "  (3) corr_SPY/QQQ/XLK/XLY: the ETF leg of these 20-day return correlations",
+    "      was aggregated from the 1-minute store with LAST(close) and no session",
+    "      filter, so it was a post-market print (mean 11.9 bps, max 70.5 bps from",
+    "      the official close) and the series ended 2025-07-31, leaving every",
+    "      corr_* undefined over the forward window. They are daily features and",
+    "      now take official closes from the same daily panel as the stocks.",
+    "      All four ICs strengthen slightly on the cleaner basis (corr_SPY",
+    "      -0.012 -> -0.014, corr_XLY -0.010 -> -0.012), and one more feature",
+    "      clears the BHY threshold. BH is unchanged at 14; track_b is unchanged.",
+    "  (1) vwap_dev: intraday VWAP came from raw 1-minute bars while the close",
+    "      came from the split-adjusted daily panel, so the feature equalled",
+    "      (1 - split factor) before every split. Both legs now come from the",
+    "      same raw bars. The corrected feature is a genuine reversal signal and",
+    "      is still selected, on honest data.",
+    "  (2) overnight_gap: the tier-2 winsoriser rebuilt the close from clipped",
+    "      returns but left open on the original basis, so every gap after a",
+    "      ticker's first clipped day carried a constant factor. The whole bar is",
+    "      now rescaled.",
+    "Source: results/staging/fdr_v3.log (2026-09-16), estimand = daily",
+    "cross-sectional Spearman IC over Screen 0 eligible names, null = stationary",
+    "block bootstrap (block 21, B=1000, seed 42), q=0.10.",
+    "Validity checks on the same estimand: placebo 0/10 rejected on both tracks;",
+    "5-day purged embargo leaves both selected sets unchanged (14 and 1)."
+  ],
+  "track_a": {
+    "bh_rejected": 14,
+    "bhy_rejected": 13
+  },
+  "track_b": {
+    "bh_rejected": 1,
+    "bhy_rejected": 0
+  }
+}

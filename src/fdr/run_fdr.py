@@ -44,6 +44,7 @@ from src.models.model_suite import make_fold_dates
 from src.fdr.bh_correction import benjamini_hochberg, bhy_procedure
 from src.universe_paths import proc, universe_suffix
 from src.features.feature_spec import feature_columns as _feature_columns
+from src.data.lean_load import load_features_lean
 import src.manifest as manifest
 
 FEATURES_PATH = proc(ROOT, "features_all.parquet")
@@ -217,6 +218,35 @@ def stationary_bootstrap_pvalue(
 # Fold-level daily cross-sectional IC computation
 # ---------------------------------------------------------------------------
 
+def _is_calm_regime(reg) -> bool | None:
+    """Classify one day's regime value. Returns None when it is unknown.
+
+    ``regime_vix`` holds the VIX *level* (a float), not a label. The previous
+    implementation tested ``str(reg).lower() == "calm"``, which is never true of
+    "16.89", so every day was classified stressed, the calm sub-series was empty
+    by construction, and the regime split reported "calm: 0 rejections,
+    stressed: <the full-sample count>" in both this revision and the submitted
+    version. VIX_CALM_THRESH was defined but never read. Both the numeric and
+    the label form are handled here so the column can carry either.
+    """
+    if reg is None:
+        return None
+    if isinstance(reg, (bool, np.bool_)):
+        return None
+    if isinstance(reg, (int, float, np.number)):
+        val = float(reg)
+        if np.isnan(val):
+            return None
+        return val <= VIX_CALM_THRESH
+
+    label = str(reg).strip().lower()
+    if label in {"calm", "low", "low_vol", "quiet"}:
+        return True
+    if label in {"stressed", "high", "high_vol", "crisis"}:
+        return False
+    return None
+
+
 def compute_fold_ics(
     df: pd.DataFrame,
     features: list,
@@ -309,14 +339,12 @@ def compute_fold_ics(
                 all_records[feat][d] = ic_val
 
                 if has_regime:
-                    reg = regime_per_date.get(d)
-                    # "calm" when regime label is "calm" or numeric <= VIX_CALM_THRESH
-                    try:
-                        is_calm = (str(reg).lower() == "calm")
-                    except Exception:
-                        is_calm = False
-
-                    if is_calm:
+                    is_calm = _is_calm_regime(regime_per_date.get(d))
+                    if is_calm is None:
+                        # Unknown regime: assign to neither sub-series rather
+                        # than defaulting into "stressed".
+                        pass
+                    elif is_calm:
                         calm_records[feat][d] = ic_val
                     else:
                         stressed_records[feat][d] = ic_val
@@ -395,13 +423,23 @@ def main():
     fdr_ns = f"fdr{universe_suffix()}"
     log(f"  manifest namespace: {fdr_ns}")
 
-    df = pd.read_parquet(FEATURES_PATH)
+    df = load_features_lean(FEATURES_PATH)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
     )
 
     features   = _feature_columns(df)
     fold_dates = make_fold_dates()
+
+    # The regime split degrades silently to "0 selected in every regime" if the
+    # label column is absent, which is indistinguishable from a real null
+    # result in the log. Fail here instead.
+    if "regime_vix" not in df.columns:
+        raise KeyError(
+            "regime_vix missing from the loaded panel: the calm/stressed split "
+            "would report 0 rejections everywhere without being wrong. Add it "
+            "to lean_load.DEFAULT_EXTRAS."
+        )
 
     log(f"  Pre-registered features for BH/BHY test: {len(features)}")
     log(f"  Features: {features}")
@@ -486,28 +524,96 @@ def main():
             )
 
         # --- Regime bootstrap stats ---
+        # BH runs ONCE over the pooled 2m = 60 feature-by-regime hypotheses, not
+        # separately within each regime. The paper describes this family as
+        # "2m = 60", and two independent m = 30 corrections do not control the
+        # FDR of that family: they are the more permissive procedure.
+        regime_boot: dict[str, dict] = {}
+        regime_days: dict[str, int] = {}
         for regime_name, daily_ic_regime in [
             ("calm",     daily_ic_calm),
             ("stressed", daily_ic_stressed),
         ]:
-            boot_stats_regime = {}
-            for feat in features:
-                boot_stats_regime[feat] = stationary_bootstrap_pvalue(
+            stats_r = {
+                feat: stationary_bootstrap_pvalue(
                     daily_ic_regime[feat],
                     block_len=BLOCK_LENGTH_DAYS,
                     n=N_BOOTSTRAP,
                     seed=BOOTSTRAP_SEED,
                 )
+                for feat in features
+            }
+            regime_boot[regime_name] = stats_r
+            regime_days[regime_name] = int(max(
+                (stats_r[f]["n_days"] for f in features), default=0
+            ))
 
-            regime_result = run_bh_bhy_on_boot_stats(
-                boot_stats_regime, track=track, q=FDR_Q
-            )
-            regime_result.insert(2, "regime", regime_name)
+        # Keep (regime, feature) as a pair rather than packing it into a string:
+        # the p-value vector and the labels stay positionally aligned, with no
+        # separator to parse back out.
+        pooled_keys = [(r, f) for r in ("calm", "stressed") for f in features]
+        pooled_p = np.array(
+            [regime_boot[r][f]["boot_p"] for r, f in pooled_keys], dtype=float
+        )
+        bh_rej, bh_adj   = benjamini_hochberg(pooled_p, q=FDR_Q)
+        bhy_rej, bhy_adj = bhy_procedure(pooled_p, q=FDR_Q)
+
+        pooled_result = pd.DataFrame({
+            "track":        track,
+            "regime":       [r for r, _ in pooled_keys],
+            "feature":      [f for _, f in pooled_keys],
+            "n_days":       [regime_boot[r][f]["n_days"]  for r, f in pooled_keys],
+            "ic_bar":       [regime_boot[r][f]["ic_bar"]  for r, f in pooled_keys],
+            "t_stat":       [regime_boot[r][f]["t_stat"]  for r, f in pooled_keys],
+            "boot_p":       pooled_p,
+            "ci_low":       [regime_boot[r][f]["ci_low"]  for r, f in pooled_keys],
+            "ci_high":      [regime_boot[r][f]["ci_high"] for r, f in pooled_keys],
+            "bh_adj_p":     bh_adj,
+            "bh_rejected":  bh_rej,
+            "bhy_adj_p":    bhy_adj,
+            "bhy_rejected": bhy_rej,
+        })
+
+        for regime_name in ("calm", "stressed"):
+            regime_result = pooled_result[pooled_result["regime"] == regime_name]
             all_regime.append(regime_result)
 
-            n_reg_bh  = int(regime_result["bh_rejected"].sum())
-            n_reg_bhy = int(regime_result["bhy_rejected"].sum())
-            log(f"\n  Regime [{regime_name}]: BH {n_reg_bh}  BHY {n_reg_bhy} selected")
+            n_reg_bh   = int(regime_result["bh_rejected"].sum())
+            n_reg_bhy  = int(regime_result["bhy_rejected"].sum())
+            n_reg_days = regime_days[regime_name]
+            # Report the sample size alongside the count: "0 selected" on an
+            # empty sub-series reads exactly like a genuine null result, which
+            # is how the mislabelled regime split went unnoticed.
+            log(f"\n  Regime [{regime_name}]: BH {n_reg_bh}  BHY {n_reg_bhy} "
+                f"selected  (max {n_reg_days} days in sub-series, "
+                f"pooled family m={len(pooled_keys)})")
+
+            # Record the regime results, including the day count. The regime
+            # table was previously unverifiable against any authoritative
+            # source, which is how a count over an empty sub-sample survived
+            # into print; the day count is what makes "0 selected" readable as
+            # either a null result or a broken split.
+            manifest.record(
+                f"{fdr_ns}.{track}.regime.{regime_name}.n_selected_bh",
+                n_reg_bh, stage="fdr", track=short_track,
+                meta={"n_days": n_reg_days,
+                      "pooled_family_m": len(pooled_keys),
+                      "vix_calm_thresh": VIX_CALM_THRESH},
+            )
+            manifest.record(
+                f"{fdr_ns}.{track}.regime.{regime_name}.n_selected_bhy",
+                n_reg_bhy, stage="fdr", track=short_track,
+            )
+            manifest.record(
+                f"{fdr_ns}.{track}.regime.{regime_name}.n_days",
+                n_reg_days, stage="fdr", track=short_track,
+            )
+            if n_reg_days == 0:
+                raise ValueError(
+                    f"regime '{regime_name}' has no days: the split is broken, "
+                    f"not null. Check regime_vix values against VIX_CALM_THRESH="
+                    f"{VIX_CALM_THRESH}."
+                )
 
     # --- Save ---
     out_main   = pd.concat(all_results, ignore_index=True)

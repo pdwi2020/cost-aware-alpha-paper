@@ -69,3 +69,6 @@ data/processed/r2000_inputs/
 
 # generated pipeline outputs (regenerated from spec; not source)
 results/
+
+# Superseded run artefacts kept on disk for provenance, never committed
+data/processed/*.parquet.*

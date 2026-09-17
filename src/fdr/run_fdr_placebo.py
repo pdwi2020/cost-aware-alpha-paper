@@ -23,16 +23,23 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.fdr.bh_correction import compute_ic_tstats, benjamini_hochberg
+from src.fdr.bh_correction import benjamini_hochberg
+from src.fdr.run_fdr import (
+    BLOCK_LENGTH_DAYS,
+    BOOTSTRAP_SEED,
+    N_BOOTSTRAP,
+    compute_fold_ics,
+    stationary_bootstrap_pvalue,
+)
 from src.models.model_suite import make_fold_dates
 from src.features.feature_spec import feature_columns as _feature_columns
+from src.data.lean_load import load_features_lean
 
 FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
 OUT_PLACEBO   = ROOT / "data" / "processed" / "fdr_placebo.parquet"
@@ -46,33 +53,38 @@ PLACEBO_PREFIX = "PLACEBO_"
 def log(msg): print(msg, flush=True)
 
 
-def compute_fold_ics_with_placebo(
-    df: pd.DataFrame,
-    real_features: list,
-    placebo_features: list,
-    target_col: str,
-    fold_dates: list,
-) -> pd.DataFrame:
-    """Per-fold Spearman IC for real + placebo features."""
-    all_features = real_features + placebo_features
-    dates        = df.index.get_level_values("date")
-    targets      = df[target_col]
-    records      = []
+def placebo_bh(daily_ic: dict, all_features: list, track: str) -> pd.DataFrame:
+    """BH on the same estimand and null as the headline test.
 
-    for fd in fold_dates:
-        te_mask = (dates >= pd.Timestamp(fd["test_start"])) & \
-                  (dates <= pd.Timestamp(fd["test_end"]))
-        valid   = te_mask & targets.notna()
-        X_te    = df.loc[valid, all_features]
-        y_te    = targets[valid].values
-        row     = {"fold": fd["fold_id"]}
-        for feat in all_features:
-            x  = X_te[feat].values
-            ok = ~np.isnan(x) & ~np.isnan(y_te)
-            row[feat] = float(spearmanr(x[ok], y_te[ok])[0]) if ok.sum() >= 20 else np.nan
-        records.append(row)
+    The point of this check is that the procedure the paper reports is
+    calibrated, so it has to be that procedure: daily cross-sectional IC over
+    Screen 0 eligible names, with stationary-block-bootstrap p-values. The
+    earlier version instead used a t-test across the nine fold-mean ICs and
+    skipped the Screen 0 mask, so a "PASS" certified an estimator that appears
+    nowhere in the manuscript.
+    """
+    boot_stats = {
+        f: stationary_bootstrap_pvalue(
+            daily_ic[f],
+            block_len=BLOCK_LENGTH_DAYS,
+            n=N_BOOTSTRAP,
+            seed=BOOTSTRAP_SEED,
+        )
+        for f in all_features
+    }
+    p_values = np.array([boot_stats[f]["boot_p"] for f in all_features], dtype=float)
+    reject, adj_p = benjamini_hochberg(p_values, q=FDR_Q)
 
-    return pd.DataFrame(records).set_index("fold")
+    return pd.DataFrame({
+        "track":      track,
+        "feature":    all_features,
+        "is_placebo": [f.startswith(PLACEBO_PREFIX) for f in all_features],
+        "mean_ic":    [boot_stats[f]["ic_bar"] for f in all_features],
+        "t_stat":     [boot_stats[f]["t_stat"] for f in all_features],
+        "p_value":    p_values,
+        "bh_adj_p":   adj_p,
+        "rejected":   reject,
+    })
 
 
 def inject_placebo_features(
@@ -114,7 +126,7 @@ def main():
     t0 = time.time()
 
     log("Loading features_all.parquet …")
-    df = pd.read_parquet(FEATURES_PATH)
+    df = load_features_lean(FEATURES_PATH)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
     )
@@ -127,6 +139,9 @@ def main():
     log(f"  Placebo features: {N_PLACEBO}  (prefix {PLACEBO_PREFIX!r})")
     log(f"  Total hypotheses: {len(real_features) + N_PLACEBO}")
     log(f"  BH q={FDR_Q} → expected placebo rejections ≤ {FDR_Q * N_PLACEBO:.1f}")
+    log(f"  Estimand: daily cross-sectional IC over s0_eligible names; null: "
+        f"stationary block bootstrap (block_len={BLOCK_LENGTH_DAYS}, "
+        f"n={N_BOOTSTRAP}, seed={BOOTSTRAP_SEED}) — identical to run_fdr.py")
 
     log("Injecting placebo features …")
     df_aug, placebo_names = inject_placebo_features(df)
@@ -139,24 +154,9 @@ def main():
         log(f"  Track: {track.upper()}")
         log(f"{'='*60}")
 
-        ic_df = compute_fold_ics_with_placebo(
-            df_aug, real_features, placebo_names, target_col, fold_dates
-        )
-
         all_feat = real_features + placebo_names
-        mean_ic, t_stats, p_values = compute_ic_tstats(ic_df)
-        reject, adj_p = benjamini_hochberg(p_values.values, q=FDR_Q)
-
-        result = pd.DataFrame({
-            "track":    track,
-            "feature":  all_feat,
-            "is_placebo": [f.startswith(PLACEBO_PREFIX) for f in all_feat],
-            "mean_ic":  mean_ic.values,
-            "t_stat":   t_stats.values,
-            "p_value":  p_values.values,
-            "bh_adj_p": adj_p,
-            "rejected": reject,
-        })
+        daily_ic, _, _ = compute_fold_ics(df_aug, all_feat, target_col, fold_dates)
+        result = placebo_bh(daily_ic, all_feat, track)
 
         n_real_rej    = result[~result["is_placebo"] & result["rejected"]].shape[0]
         n_placebo_rej = result[result["is_placebo"]  & result["rejected"]].shape[0]

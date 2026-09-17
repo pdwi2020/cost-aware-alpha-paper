@@ -42,7 +42,7 @@ FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
 REGIME_PATH = ROOT / "data" / "processed" / "fdr_regime.parquet"
 SHAP_PATH   = ROOT / "data" / "processed" / "shap_summary.parquet"
 FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
 OUT_RESULTS = ROOT / "data" / "processed" / "regime_signal_results.parquet"
@@ -259,7 +259,11 @@ def main():
     shap_df    = pd.read_parquet(SHAP_PATH)
 
     log("Loading features_all.parquet …")
-    feat_df = pd.read_parquet(FEAT_PATH)
+    # Lean load: frozen-specification columns plus regime_vix, which this
+    # script splits on. The full float64 panel does not fit in 8 GB.
+    from src.data.lean_load import load_features_lean
+
+    feat_df = load_features_lean(FEAT_PATH)
     log("Loading OHLCV …")
     ohlcv   = pd.read_parquet(OHLCV_PATH)
 

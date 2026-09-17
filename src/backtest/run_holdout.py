@@ -1,4 +1,4 @@
-"""Exp 7 (Week 10): Holdout validation on 2022–2024 (FIRST TOUCH of holdout data).
+"""Locked single-touch OOS validation on the 2025 window (January to July).
 
 This is the only authorized look at the holdout period. The strategy
 parameters (signal weights, cost model, rebalancing frequency) are
@@ -10,7 +10,7 @@ Fixed parameters (from IS):
   - Costs: base case (spread=3bps, impact=0.10), AUM=$100M
 
 Outputs:
-    data/processed/holdout_pnl.parquet      — daily P&L 2022-2024
+    data/processed/holdout_pnl.parquet      — daily P&L over the locked window
     data/processed/holdout_metrics.parquet  — performance metrics
 
 Run:
@@ -31,7 +31,9 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+import src.manifest as manifest
 from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.oos_inference import window_inference
 from src.backtest.generate_signals import (
     build_signal_weights,
     generate_composite_signal,
@@ -41,14 +43,18 @@ from src.universe_paths import proc
 FDR_PATH    = proc(ROOT, "fdr_results.parquet")
 SHAP_PATH   = proc(ROOT, "shap_summary.parquet")
 FEAT_PATH   = proc(ROOT, "features_all.parquet")
-OHLCV_PATH  = proc(ROOT, "daily_ohlcv.parquet")
+OHLCV_PATH  = proc(ROOT, "daily_ohlcv_v3.parquet")
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
 OUT_PNL     = proc(ROOT, "holdout_pnl.parquet")
+INFERENCE_SEED = 42   # fixed so the window CI is reproducible
 OUT_METRICS = proc(ROOT, "holdout_metrics.parquet")
 
 HOLDOUT_START = "2025-01-01"   # LOCKED single-touch OOS (2022-2024 demoted to exploratory)
-HOLDOUT_END   = "2025-07-31"   # data max
+HOLDOUT_END   = "2025-07-31"   # end of the locked window as originally declared;
+                               # the v3 panel now extends further, but this
+                               # window is fixed by the single-touch rule and is
+                               # NOT extended to use the newer data
 
 # Fixed from IS: weekly rebalancing (Pareto-optimal from Week 9)
 REBAL_FREQ = 5
@@ -106,9 +112,19 @@ def build_returns_vol_adv_holdout(ohlcv, tickers, start, end):
     return returns[ret_mask], vol[ret_mask], adv_dollars[ret_mask], close_w[ret_mask]
 
 
-def main():
-    log("=== Locked single-touch OOS validation 2025 (FIRST TOUCH) ===\n")
-    log(f"  Holdout window: {HOLDOUT_START} → {HOLDOUT_END}")
+def main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--start", default=HOLDOUT_START)
+    ap.add_argument("--end", default=HOLDOUT_END)
+    ap.add_argument("--label", default="locked_oos_2025",
+                    help="manifest namespace and output suffix for this window")
+    args = ap.parse_args(argv)
+    start_w, end_w = args.start, args.end
+
+    log(f"=== Window evaluation: {args.label} ===\n")
+    log(f"  Window: {start_w} → {end_w}")
     log(f"  Rebalancing: {REBAL_FREQ}-day (weekly, Pareto-optimal from Week 9)")
     log(f"  Costs: base case (spread=3bps, impact=0.10, AUM=$100M)\n")
     t0 = time.time()
@@ -127,6 +143,7 @@ def main():
     aum_dollars = cfg.get("aum_dollars", 1e8)
 
     all_metrics = []
+    pnl_by_track: dict[str, pd.DataFrame] = {}
 
     for track in ["track_a", "track_b"]:
         log(f"\n{'='*55}")
@@ -140,18 +157,18 @@ def main():
             log(f"  [SKIP] {e} — no deployable {track} strategy under the corrected FDR.")
             continue
 
-        # Generate holdout signals (2022-2024)
+        # Generate holdout signals over the locked window
         sig = generate_composite_signal(
             feat_df, weights,
-            start_date=HOLDOUT_START,
-            end_date=HOLDOUT_END,
+            start_date=start_w,
+            end_date=end_w,
         )
         log(f"  Signal: {sig.shape[0]} dates × {sig.shape[1]} tickers")
         log(f"  Date range: {sig.index.min().date()} → {sig.index.max().date()}")
 
         tickers = sig.columns.tolist()
         returns, vol, adv_dollars, close_px = build_returns_vol_adv_holdout(
-            ohlcv, tickers, HOLDOUT_START, HOLDOUT_END
+            ohlcv, tickers, start_w, end_w
         )
 
         sim = PortfolioSimulator(
@@ -194,10 +211,11 @@ def main():
             min_adv_dollars=min_adv,
         )
         pnl_df.insert(0, "track", track)
+        pnl_by_track[track] = pnl_df
 
         metrics = sim.compute_metrics(pnl_df.drop(columns="track"))
 
-        log(f"\n  Holdout Results (2022–2024):")
+        log(f"\n  Holdout Results ({HOLDOUT_START} to {HOLDOUT_END}):")
         log(f"    Gross Sharpe : {metrics.get('gross_pnl_sharpe', float('nan')):+.3f}")
         log(f"    Net   Sharpe : {metrics.get('net_pnl_sharpe', float('nan')):+.3f}")
         log(f"    Gross Annual : {metrics.get('gross_pnl_annual', float('nan'))*100:+.2f}%")
@@ -210,35 +228,124 @@ def main():
         all_metrics.append({"track": track, **metrics})
 
         if not hasattr(pnl_df, "_combined"):
-            pnl_df.to_parquet(str(OUT_PNL).replace(".parquet", f"_{track}.parquet"), index=True)
+            # The metrics file is suffixed by label (below) but this one was not,
+            # so evaluating a second window overwrote the first window's daily
+            # P&L in place. The per-year exploratory breakdown then had no
+            # recoverable source. Keep the unsuffixed name for the locked window
+            # so existing references resolve, and suffix every other window.
+            stem = f"_{track}.parquet" if args.label == "locked_oos_2025" \
+                else f"_{args.label}_{track}.parquet"
+            pnl_df.to_parquet(str(OUT_PNL).replace(".parquet", stem), index=True)
 
     # ── IS vs OOS comparison ──────────────────────────────────────────────
     log(f"\n{'='*55}")
-    log("  IS (2013-2021, weekly) vs OOS (2022-2024, weekly) Comparison")
+    log(f"  IS (2013-2021, weekly) vs {args.label} "
+        f"({start_w} to {end_w}, weekly) Comparison")
     log(f"{'='*55}")
 
-    # Load IS results from sensitivity_3d (weekly, base costs)
+    # Load IS results from sensitivity_3d at the DEPLOYED configuration
+    # (weekly rebalancing, base costs). These were previously logged and then
+    # discarded, so the manifest's IS figures stayed at their pre-v3 values
+    # while the window figures moved, and the manuscript compared a v3 window
+    # against a v2 in-sample baseline. A failure here is reported rather than
+    # swallowed: a missing IS leg makes the comparison below meaningless.
     try:
         sens = pd.read_parquet(proc(ROOT, "sensitivity_3d.parquet"))
-        is_base = sens[(sens.spread_bps == 3) & (sens.impact_coeff == 0.10) & (sens.rebal_freq == 5)]
-        log(f"\n  IS (2013-2021):")
+        is_base = sens[(sens.spread_bps == 3) & (sens.impact_coeff == 0.10)
+                       & (sens.rebal_freq == 5)]
+        if is_base.empty:
+            raise ValueError(
+                "no (spread=3, impact=0.10, rebal=5) row in sensitivity_3d.parquet"
+            )
+        log(f"\n  IS (2013-2021, weekly = deployed):")
         for _, row in is_base.iterrows():
-            log(f"    {row['track'].upper()}: "
+            track = row["track"]
+            log(f"    {track.upper()}: "
                 f"gross_SR={row['gross_pnl_sharpe']:+.3f}  "
                 f"net_SR={row['net_pnl_sharpe']:+.3f}  "
                 f"TO={row['annual_turnover']:.1f}x")
-    except Exception:
-        pass
+            for field, key in (("gross_pnl_sharpe", "is_gross_sharpe_weekly"),
+                               ("net_pnl_sharpe", "is_net_sharpe_weekly"),
+                               ("annual_turnover", "is_annual_turnover_weekly"),
+                               ("cost_drag_bps", "is_cost_drag_bps_weekly")):
+                if field in row.index:
+                    manifest.record(
+                        f"backtest.{track}.{key}", round(float(row[field]), 4),
+                        stage="backtest", track=track.split("_")[1].upper(),
+                        meta={"rebal_freq": 5, "spread_bps": 3, "impact_coeff": 0.10,
+                              "window": "2013-01-01..2021-12-31",
+                              "source": "sensitivity_3d.parquet"},
+                    )
+    except Exception as exc:
+        log(f"  [WARN] IS baseline unavailable, not recorded: {exc}")
 
-    log(f"\n  OOS (2022-2024):")
+    log(f"\n  Window {args.label} ({start_w} to {end_w}):")
     for m in all_metrics:
         log(f"    {m['track'].upper()}: "
             f"gross_SR={m.get('gross_pnl_sharpe', float('nan')):+.3f}  "
             f"net_SR={m.get('net_pnl_sharpe', float('nan')):+.3f}  "
             f"TO={m.get('annual_turnover', float('nan')):.1f}x")
 
-    pd.DataFrame(all_metrics).to_parquet(OUT_METRICS, index=False)
-    log(f"\nSaved → {OUT_METRICS}")
+    for m in all_metrics:
+        ns = f"window.{args.label}.{m['track']}"
+        for field, key in (("gross_pnl_sharpe", "gross_sharpe"),
+                           ("net_pnl_sharpe", "net_sharpe"),
+                           ("annual_turnover", "annual_turnover"),
+                           ("cost_drag_bps", "cost_drag_bps"),
+                           ("n_days", "n_days")):
+            if m.get(field) is not None:
+                manifest.record(f"{ns}.{key}", float(m[field]), stage="window",
+                                track=m["track"].split("_")[1].upper(),
+                                meta={"start": start_w, "end": end_w,
+                                      "label": args.label})
+
+    # Inference on the window's daily net P&L: bootstrap CI, HAC t, and the
+    # four-way economic classification. This was previously computed outside the
+    # pipeline and pasted into the manifest, so the p-value, CI and class stayed
+    # frozen at an earlier run's values while the Sharpe beside them moved.
+    for track, pnl_df in sorted(pnl_by_track.items()):
+        if "net_pnl" not in pnl_df.columns:
+            log(f"  [WARN] {track}: no net_pnl column, inference skipped")
+            continue
+        series = pnl_df["net_pnl"].to_numpy(dtype=float)
+        try:
+            inf = window_inference(series, seed=INFERENCE_SEED)
+        except Exception as exc:
+            log(f"  [WARN] {track}: inference failed, not recorded: {exc}")
+            continue
+        ns = f"window.{args.label}.{track}"
+        meta = {"start": start_w, "end": end_w, "label": args.label,
+                "B": inf["T"], "seed": inf["seed"], "sr_star": inf["sr_star"]}
+        manifest.record(f"{ns}.net_sharpe_boot_p", float(inf["boot_p"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        manifest.record(f"{ns}.net_sharpe_nw_t", float(inf["newey_west"]["t"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        manifest.record(f"{ns}.net_sharpe_ci95_lo", float(inf["ci_95"]["lo"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        manifest.record(f"{ns}.net_sharpe_ci95_hi", float(inf["ci_95"]["hi"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        # The classification is decided on the 90% CI (two one-sided tests at 5%),
+        # so record that interval too: otherwise the paper reports a class whose
+        # basis is absent from the manifest.
+        manifest.record(f"{ns}.net_sharpe_ci90_lo", float(inf["ci_90"]["lo"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        manifest.record(f"{ns}.net_sharpe_ci90_hi", float(inf["ci_90"]["hi"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        manifest.record(f"{ns}.classification", str(inf["primary_classification"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        manifest.record(f"{ns}.min_detectable_sharpe",
+                        float(inf["min_detectable_sharpe"]),
+                        stage="window", track=track.split("_")[1].upper(), meta=meta)
+        log(f"  {track.upper()} inference: SR={inf['sharpe_ann']:+.3f} "
+            f"95% CI [{inf['ci_95']['lo']:+.2f}, {inf['ci_95']['hi']:+.2f}] "
+            f"90% CI [{inf['ci_90']['lo']:+.2f}, {inf['ci_90']['hi']:+.2f}] "
+            f"boot p={inf['boot_p']:.4f} NW t={inf['newey_west']['t']:+.3f} "
+            f"-> {inf['primary_classification']}")
+
+    out_metrics = OUT_METRICS if args.label == "locked_oos_2025" else \
+        OUT_METRICS.with_name(f"holdout_metrics_{args.label}.parquet")
+    pd.DataFrame(all_metrics).to_parquet(out_metrics, index=False)
+    log(f"\nSaved → {out_metrics}")
     log(f"Saved holdout P&L → {OUT_PNL.parent}/holdout_pnl_track_*.parquet")
     log(f"Total elapsed: {time.time()-t0:.1f}s")
 

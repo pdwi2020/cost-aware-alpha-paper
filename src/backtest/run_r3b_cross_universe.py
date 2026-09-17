@@ -35,7 +35,7 @@ from src.backtest.generate_signals import build_signal_weights, generate_composi
 FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
 SHAP_PATH   = ROOT / "data" / "processed" / "shap_summary.parquet"
 FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 NDX_PATH    = ROOT / "data" / "processed" / "ndx100_tickers.csv"
 SPX100_PATH = ROOT / "data" / "processed" / "spx100_tickers.csv"
@@ -92,7 +92,10 @@ def main():
     target = set(ndx + spx100)
 
     log("Loading features_all.parquet …")
-    feat_df = pd.read_parquet(FEAT_PATH)
+    # Lean load: frozen-specification columns only (683 MB panel, 8 GB machine).
+    from src.data.lean_load import load_features_lean
+
+    feat_df = load_features_lean(FEAT_PATH)
     existing = set(feat_df.index.get_level_values("ticker").unique())
     overlap  = sorted(target & existing)
     missing  = sorted(target - existing)
@@ -172,9 +175,13 @@ def main():
         log(sub.to_string(index=False))
 
     # vs. full-universe benchmark
-    log("\n=== vs. full S&P-500 benchmark ===")
+    # Benchmark over THIS script's window. holdout_metrics.parquet holds the
+    # locked 2025 window, so reading it here differenced a 2022-2024
+    # sub-universe against a 2025 benchmark and printed a meaningless delta.
+    log(f"\n=== vs. full S&P-500 benchmark ({HOLDOUT_START[:4]}-{HOLDOUT_END[:4]}) ===")
     try:
-        bm = pd.read_parquet(ROOT / "data" / "processed" / "holdout_metrics.parquet")
+        bm = pd.read_parquet(ROOT / "data" / "processed"
+                             / "holdout_metrics_exploratory_2022_2024.parquet")
         for track in ["track_a", "track_b"]:
             full_sr = float(bm[bm["track"] == track]["net_pnl_sharpe"].iloc[0])
             sub_sr  = float([m for m in all_metrics if m["track"] == track][0]["net_pnl_sharpe"])

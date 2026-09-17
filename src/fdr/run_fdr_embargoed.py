@@ -24,15 +24,22 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.fdr.bh_correction import compute_ic_tstats, benjamini_hochberg
+from src.fdr.bh_correction import benjamini_hochberg, bhy_procedure
+from src.fdr.run_fdr import (
+    BLOCK_LENGTH_DAYS,
+    BOOTSTRAP_SEED,
+    N_BOOTSTRAP,
+    compute_fold_ics,
+    stationary_bootstrap_pvalue,
+)
 from src.features.feature_spec import feature_columns as _feature_columns
+from src.data.lean_load import load_features_lean
 
 FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
 BASELINE_PATH = ROOT / "data" / "processed" / "fdr_results.parquet"
@@ -70,42 +77,42 @@ def make_fold_dates_embargoed(
     return folds
 
 
-def compute_fold_ics_embargoed(
-    df: pd.DataFrame,
-    features: list,
-    target_col: str,
-    fold_dates: list,
-) -> pd.DataFrame:
-    """Per-fold Spearman IC with embargoed test windows."""
-    dates   = df.index.get_level_values("date")
-    targets = df[target_col]
-    records = []
-    for fd in fold_dates:
-        te_mask = (dates >= pd.Timestamp(fd["test_start"])) & \
-                  (dates <= pd.Timestamp(fd["test_end"]))
-        valid   = te_mask & targets.notna()
-        X_te    = df.loc[valid, features]
-        y_te    = targets[valid].values
-        row     = {"fold": fd["fold_id"], "n_test": int(valid.sum())}
-        for feat in features:
-            x = X_te[feat].values
-            ok = ~np.isnan(x) & ~np.isnan(y_te)
-            row[feat] = float(spearmanr(x[ok], y_te[ok])[0]) if ok.sum() >= 20 else np.nan
-        records.append(row)
-    return pd.DataFrame(records).set_index("fold")
+def run_bh_embargoed(daily_ic: dict, features: list, track: str) -> pd.DataFrame:
+    """BH/BHY on the same estimand and null as the headline test.
 
+    This must mirror run_fdr.py exactly: the daily cross-sectional IC series,
+    with p-values from the stationary block bootstrap. An earlier version used
+    a one-sample t-test across the nine fold-mean ICs (df = 8). That test is
+    badly anti-conservative here, because averaging within a fold removes the
+    day-to-day variation the block bootstrap correctly retains: it reported 24
+    of 30 Track B rejections against the headline test's 1. Comparing that
+    count to the bootstrap baseline measured the change of estimator, not the
+    effect of the embargo, which is the only thing this check is for.
+    """
+    boot_stats = {
+        f: stationary_bootstrap_pvalue(
+            daily_ic[f],
+            block_len=BLOCK_LENGTH_DAYS,
+            n=N_BOOTSTRAP,
+            seed=BOOTSTRAP_SEED,
+        )
+        for f in features
+    }
+    p_values = np.array([boot_stats[f]["boot_p"] for f in features], dtype=float)
+    bh_reject, bh_adj_p   = benjamini_hochberg(p_values, q=FDR_Q)
+    bhy_reject, bhy_adj_p = bhy_procedure(p_values, q=FDR_Q)
 
-def run_bh_embargoed(ic_df: pd.DataFrame, track: str) -> pd.DataFrame:
-    mean_ic, t_stats, p_values = compute_ic_tstats(ic_df.drop(columns="n_test", errors="ignore"))
-    reject, adj_p = benjamini_hochberg(p_values.values, q=FDR_Q)
     return pd.DataFrame({
-        "track":       track,
-        "feature":     ic_df.drop(columns="n_test", errors="ignore").columns.tolist(),
-        "ic_bar":      mean_ic.values,
-        "t_stat":      t_stats.values,
-        "boot_p":      p_values.values,
-        "bh_adj_p":    adj_p,
-        "bh_rejected": reject,
+        "track":        track,
+        "feature":      features,
+        "n_days":       [boot_stats[f]["n_days"] for f in features],
+        "ic_bar":       [boot_stats[f]["ic_bar"] for f in features],
+        "t_stat":       [boot_stats[f]["t_stat"] for f in features],
+        "boot_p":       p_values,
+        "bh_adj_p":     bh_adj_p,
+        "bh_rejected":  bh_reject,
+        "bhy_adj_p":    bhy_adj_p,
+        "bhy_rejected": bhy_reject,
     }).sort_values(["bh_rejected", "boot_p"], ascending=[False, True])
 
 
@@ -114,7 +121,7 @@ def main():
     t0 = time.time()
 
     log("Loading features_all.parquet …")
-    df = pd.read_parquet(FEATURES_PATH)
+    df = load_features_lean(FEATURES_PATH)
     df.index = df.index.set_levels(
         [df.index.levels[0], pd.to_datetime(df.index.levels[1])]
     )
@@ -124,6 +131,9 @@ def main():
     fold_dates = make_fold_dates_embargoed()
 
     log(f"  Surviving features: {len(features)}")
+    log(f"  Estimand: daily cross-sectional IC; null: stationary block "
+        f"bootstrap (block_len={BLOCK_LENGTH_DAYS}, n={N_BOOTSTRAP}, "
+        f"seed={BOOTSTRAP_SEED}) — identical to run_fdr.py")
     log(f"  Folds:")
     for fd in fold_dates:
         log(f"    {fd['fold_id']}: test {fd['test_start']} → {fd['test_end']}  "
@@ -139,10 +149,11 @@ def main():
         log(f"  Track: {track.upper()}")
         log(f"{'='*60}")
 
-        ic_df    = compute_fold_ics_embargoed(df, features, target_col, fold_dates)
-        result   = run_bh_embargoed(ic_df, track)
+        daily_ic, _, _ = compute_fold_ics(df, features, target_col, fold_dates)
+        result   = run_bh_embargoed(daily_ic, features, track)
         n_rej    = result["bh_rejected"].sum()
-        log(f"\n  BH rejected (embargoed, FDR q={FDR_Q}): {n_rej}/{len(features)}")
+        log(f"\n  BH rejected (embargoed, FDR q={FDR_Q}): {n_rej}/{len(features)}  "
+            f"| BHY {int(result['bhy_rejected'].sum())}/{len(features)}")
         rej_feats = result[result["bh_rejected"]]["feature"].tolist()
         log(f"  Rejected: {rej_feats}")
 

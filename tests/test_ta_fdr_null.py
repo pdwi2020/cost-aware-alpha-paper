@@ -381,12 +381,19 @@ class TestDeterminism:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_import_run_ta_fdr():
-    """run_ta_fdr.py must be importable (syntax-clean)."""
+    """run_ta_fdr.py must be importable and expose the v3 API.
+
+    ``run_ta_fdr_track`` was the v2 entry point; v3 replaced it with
+    ``run_ta_fdr_v3_track`` plus the I/O-free ``compute_bootstrap_pvalues``.
+    The two legacy helpers stay importable for src/fdr/run_pbo_deployed.py.
+    """
     import importlib
     mod = importlib.import_module("src.backtest.run_ta_fdr")
     assert hasattr(mod, "_compute_mean_net_return")
     assert hasattr(mod, "_draw_stationary_block_bootstrap_indices")
-    assert hasattr(mod, "run_ta_fdr_track")
+    assert hasattr(mod, "run_ta_fdr_v3_track")
+    assert hasattr(mod, "compute_bootstrap_pvalues")
+    assert hasattr(mod, "orientation_signs")
 
 
 def test_ast_parse_run_ta_fdr():
@@ -398,3 +405,133 @@ def test_ast_parse_run_ta_fdr():
     # Will raise SyntaxError if invalid
     tree = ast.parse(source)
     assert tree is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3 recentred joint bootstrap: size, power, containment, cost monotonicity
+# ─────────────────────────────────────────────────────────────────────────────
+
+from src.backtest.run_ta_fdr import compute_bootstrap_pvalues  # noqa: E402
+
+
+def _correlated_zero_mean_panel(n_feat, T, rng, scale=0.004):
+    """n_feat zero-mean daily P&L series sharing one common factor."""
+    common = rng.normal(0.0, scale, T)
+    return {
+        f"f{i}": 0.6 * common + 0.8 * rng.normal(0.0, scale, T)
+        for i in range(n_feat)
+    }
+
+
+class TestRecentredNullSizeAndPower:
+    """The recentred null must be correctly sized and still have power."""
+
+    def test_size_pvalues_are_approximately_uniform(self):
+        """Zero-mean books with zero costs sit exactly on H0: E[net] = 0.
+
+        Under H0 the recentred p-values must be ~Uniform(0,1): the mean should
+        sit near 0.5 and the nominal 5% rejection rate near 5%. This is the
+        property v2 did not have (its p-values clustered near 0.5 for a
+        different, mechanical reason: the static tilt stayed in the null).
+        """
+        rng_data = np.random.default_rng(11)
+        p_all = []
+        for _ in range(20):
+            gross = _correlated_zero_mean_panel(30, 400, rng_data)
+            costs = {k: np.zeros(400) for k in gross}
+            out = compute_bootstrap_pvalues(
+                gross, costs, B=199, block_length=21,
+                rng=np.random.default_rng(101),
+            )
+            p_all.extend(out["p_net"].tolist())
+
+        p = np.asarray(p_all)
+        assert len(p) == 600
+        assert 0.35 < p.mean() < 0.65, f"mean p={p.mean():.3f} (expected ~0.5)"
+        rej = float((p <= 0.05).mean())
+        assert 0.015 < rej < 0.09, f"5% rejection rate={rej:.3f} (expected ~0.05)"
+
+    def test_power_strong_signal_is_rejected(self):
+        """A book with a large positive mean must get a small p-value."""
+        rng_data = np.random.default_rng(5)
+        T = 1000
+        gross = {"strong": rng_data.normal(0.001, 0.01, T)}   # mean/sd = 0.1/day
+        costs = {"strong": np.full(T, 1e-6)}
+        out = compute_bootstrap_pvalues(
+            gross, costs, B=999, block_length=21,
+            rng=np.random.default_rng(7),
+        )
+        assert out.loc["strong", "p_net"] < 0.01
+
+
+class TestCostMonotonicity:
+    """Costs must move the p-value. In v2 they provably could not."""
+
+    @staticmethod
+    def _p_net(cost_level, seed=3):
+        rng_data = np.random.default_rng(21)
+        T = 600
+        gross = {"f": rng_data.normal(0.0004, 0.008, T)}
+        costs = {"f": np.full(T, cost_level)}
+        out = compute_bootstrap_pvalues(
+            gross, costs, B=399, block_length=21,
+            rng=np.random.default_rng(seed),
+        )
+        return float(out.loc["f", "p_net"])
+
+    def test_higher_costs_raise_p_net(self):
+        """Raising costs weakly raises p_net, and strictly for a real jump."""
+        p_low = self._p_net(0.0)
+        p_mid = self._p_net(0.0002)
+        p_high = self._p_net(0.002)
+        assert p_low <= p_mid <= p_high
+        assert p_high > p_low, (
+            f"p_net did not respond to costs: {p_low:.4f} -> {p_high:.4f}"
+        )
+
+    def test_old_design_p_is_cost_invariant(self):
+        """Regression test documenting why the v2 null was invalid.
+
+        v2 compared `mean(g[idx_b]) - mean(c)` against `mean(g) - mean(c)`:
+        the identical `mean(c)` appears on both sides, so it cancels and the
+        p-value cannot depend on the cost level, no matter how large. This
+        test reproduces that algebra directly and asserts the (wrong)
+        invariance, so any future reintroduction of the v2 comparison fails
+        loudly here.
+        """
+        rng_data = np.random.default_rng(21)
+        T = 600
+        g = rng_data.normal(0.0004, 0.008, T)
+        idx = np.array([
+            _draw_stationary_block_bootstrap_indices(T, 21, np.random.default_rng(3))
+            for _ in range(200)
+        ])
+        resampled_means = g[idx].mean(axis=1)
+
+        def p_v2(cost_level):
+            c_bar = float(np.full(T, cost_level).mean())
+            t_obs = g.mean() - c_bar
+            null = resampled_means - c_bar          # v2's null, cost included
+            return (1 + int(np.sum(null >= t_obs))) / (1 + len(null))
+
+        assert p_v2(0.0) == p_v2(0.002) == p_v2(1.0), (
+            "v2's p-value should be provably cost-invariant"
+        )
+
+
+class TestNetGrossContainment:
+    """p_net >= p_gross always (Lean: pval_antitone / tafdr_conservative)."""
+
+    def test_net_p_never_below_gross_p(self):
+        rng_data = np.random.default_rng(31)
+        T = 500
+        gross = _correlated_zero_mean_panel(10, T, rng_data)
+        costs = {k: np.abs(rng_data.normal(0.0003, 0.0001, T)) for k in gross}
+        out = compute_bootstrap_pvalues(
+            gross, costs, B=299, block_length=21,
+            rng=np.random.default_rng(13),
+        )
+        assert (out["p_net"] >= out["p_gross"] - 1e-12).all()
+        # T_obs is the net statistic (mean gross - mean cost); with costs >= 0
+        # it can never exceed the gross mean, which is what makes p_net >= p_gross.
+        assert (out["T_obs"] <= out["mean_gross"] + 1e-15).all()

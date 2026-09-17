@@ -6,6 +6,10 @@ signal at date T → position effective at T (or T+1 with 1-day lag)
 P&L at T = position_{T-1} × return_T  (return = close[T]/close[T-1] - 1)
 Cost at T = |position_T - position_{T-1}| × total_cost_per_unit
 
+``spread_bps`` is the half-spread and is charged per unit of one-way turnover.
+A buy followed by a later sale therefore pays the half-spread on both legs.
+Market impact uses a square-root participation impact model.
+
 All positions are in portfolio-weight space (fractions of gross AUM).
 Long book sums to ~+1, short book to ~-1 → gross exposure ≈ 2 × (1x leveraged).
 Scaled to gross_exposure_target from config (default 1.0 → 0.5x long, 0.5x short).
@@ -31,7 +35,13 @@ from src.backtest.almgren_chriss import (
 # ---------------------------------------------------------------------------
 
 def apply_s0_eligible(positions: pd.DataFrame, feat_df: pd.DataFrame) -> pd.DataFrame:
-    """Apply look-ahead-free Screen 0 using the pre-computed s0_eligible flag.
+    """Deprecated: apply Screen 0 by post-hoc masking and renormalisation.
+
+    Prefer ``mask_signal_screen0`` (pre-position masking, cap-safe) together
+    with ``apply_s0_daily_exit`` (post-position daily exit, no
+    renormalisation). This function's post-hoc renormalisation can breach
+    ``max_single_position``; see ``books.py`` for the corrected pipeline. It is
+    kept for backward compatibility with ``run_backtest.py``.
 
     Screen 0 (look-ahead-free) — see src/data/screen0.py
     s0_eligible at date t is derived from price[t-1], trailing ADV[t-window:t-1],
@@ -73,8 +83,47 @@ def apply_s0_eligible(positions: pd.DataFrame, feat_df: pd.DataFrame) -> pd.Data
     return positions.div(l1, axis=0).fillna(0.0)
 
 
+def mask_signal_screen0(signal: pd.DataFrame, feat_df: pd.DataFrame) -> pd.DataFrame:
+    """Mask ineligible signals before position construction and position caps."""
+    if "s0_eligible" not in feat_df.columns:
+        import warnings
+        warnings.warn(
+            "[Screen0] s0_eligible column not found in features parquet; "
+            "rebuild with build_features.py to enable look-ahead-free Screen 0. "
+            "Proceeding WITHOUT Screen 0 filter.",
+            stacklevel=2,
+        )
+        return signal
+
+    elig_wide = feat_df["s0_eligible"].unstack(level="ticker")
+    elig_wide = elig_wide.reindex(index=signal.index, columns=signal.columns)
+    elig_wide = elig_wide.fillna(False).astype(bool)
+    return signal.where(elig_wide, np.nan)
+
+
+def apply_s0_daily_exit(
+    positions: pd.DataFrame,
+    feat_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Exit ineligible holdings each day without renormalising remaining names."""
+    if "s0_eligible" not in feat_df.columns:
+        import warnings
+        warnings.warn(
+            "[Screen0] s0_eligible column not found in features parquet; "
+            "rebuild with build_features.py to enable look-ahead-free Screen 0. "
+            "Proceeding WITHOUT Screen 0 filter.",
+            stacklevel=2,
+        )
+        return positions
+
+    elig_wide = feat_df["s0_eligible"].unstack(level="ticker")
+    elig_wide = elig_wide.reindex(index=positions.index, columns=positions.columns)
+    elig_wide = elig_wide.fillna(False).astype(bool)
+    return positions.where(elig_wide, 0.0)
+
+
 class PortfolioSimulator:
-    """Simulate strategy P&L with Almgren-Chriss execution costs."""
+    """Simulate strategy P&L with spread, participation, and borrow costs."""
 
     def __init__(
         self,
@@ -255,6 +304,8 @@ class PortfolioSimulator:
         adv_dollars: Optional[pd.DataFrame] = None,
         aum_dollars: float = 1e8,
         min_adv_dollars: float = 1e6,
+        spread_bps_matrix: Optional[pd.DataFrame] = None,
+        borrow_bps_matrix: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Compute daily gross and net P&L.
 
@@ -264,11 +315,15 @@ class PortfolioSimulator:
             vol:             (date × ticker) daily volatility (for impact cost).
             adv_dollars:     (date × ticker) average daily dollar volume.
             aum_dollars:     Assumed portfolio AUM in dollars (converts weight
-                             changes to dollar notional for AC impact model).
+                             changes to dollar notional for the impact model).
             min_adv_dollars: Minimum ADV filter. Stocks with ADV below this
                              threshold are excluded from positions (set to 0)
                              to prevent bankrupt/delisted stocks from generating
                              unrealistic market-impact costs. Default $1M.
+            spread_bps_matrix: Optional date × ticker half-spread matrix. Missing
+                               cells use the configured scalar half-spread.
+            borrow_bps_matrix: Optional date × ticker annual borrow-fee matrix.
+                               Missing cells use the configured scalar fee.
 
         Returns:
             DataFrame with columns: gross_pnl, spread_cost, impact_cost,
@@ -294,57 +349,69 @@ class PortfolioSimulator:
                 index=pos.index, columns=pos.columns
             ).fillna(1e8)
 
-        records = []
-        for d in common_dates:
-            p_d     = pos.loc[d]
-            r_d     = ret.loc[d]
-            dp_d    = delta_pos.loc[d].abs()    # |Δw| per ticker
-            v_d     = vol.loc[d]
-            adv_d   = adv_dollars.loc[d]
+        pos_array = pos.to_numpy(dtype=float)
+        ret_array = ret.to_numpy(dtype=float)
+        delta_array = delta_pos.abs().to_numpy(dtype=float)
+        vol_array = vol.to_numpy(dtype=float)
+        adv_array = adv_dollars.to_numpy(dtype=float)
 
-            # Zero out positions in stocks with insufficient liquidity.
-            # Prevents bankrupt/delisted stocks (ADV → 0) from generating
-            # unrealistic AC impact costs.
-            liquid = adv_d >= min_adv_dollars
-            p_d  = p_d.where(liquid, 0.0)
-            dp_d = dp_d.where(liquid, 0.0)
+        # Apply the per-cell liquidity rule before every position-dependent cost.
+        liquid = adv_array >= min_adv_dollars
+        pos_array = np.where(liquid, pos_array, 0.0)
+        delta_array = np.where(liquid, delta_array, 0.0)
 
-            gross    = float((p_d * r_d).sum())
-            turnover = float(dp_d.sum())
+        gross = np.nansum(pos_array * ret_array, axis=1)
+        turnover = np.nansum(delta_array, axis=1)
 
-            # Spread: paid on each trade (half spread per side = full spread round-trip)
-            sc = float(dp_d.sum()) * compute_spread_cost(self.spread_bps)
-
-            # Market impact (Almgren-Chriss):
-            #   trade_dollars_i = |Δw_i| × AUM
-            #   participation_i = trade_dollars_i / ADV_i
-            #   impact_frac_i   = η × vol_i × sqrt(participation_i)
-            #   cost_i          = impact_frac_i × |Δw_i|   (as fraction of AUM)
-            participation = (dp_d * aum_dollars) / adv_d.clip(lower=1.0)
-            ic_per_stock  = self.impact_coeff * v_d * np.sqrt(participation)
-            ic = float((ic_per_stock * dp_d).sum())
-
-            # Borrow cost: only for short positions held overnight
-            bc = float(
-                p_d.clip(upper=0.0).abs().sum()
-                * (self.cfg.get("borrow_cost_easy_bps", 0) / 10_000 / 252)
+        # The configured half-spread is paid on every unit of one-way turnover.
+        if spread_bps_matrix is None:
+            spread_cost = turnover * compute_spread_cost(self.spread_bps)
+        else:
+            spread_bps = spread_bps_matrix.reindex(
+                index=pos.index, columns=pos.columns
+            ).fillna(self.spread_bps)
+            spread_cost = np.nansum(
+                delta_array * spread_bps.to_numpy(dtype=float) / 10_000,
+                axis=1,
             )
 
-            total_cost = sc + ic + bc
-            net        = gross - total_cost
+        # Square-root participation impact model.
+        participation = (
+            delta_array * aum_dollars / np.clip(adv_array, a_min=1.0, a_max=None)
+        )
+        impact_per_stock = self.impact_coeff * vol_array * np.sqrt(participation)
+        impact_cost = np.nansum(impact_per_stock * delta_array, axis=1)
 
-            records.append({
-                "date":        d,
-                "gross_pnl":   gross,
-                "spread_cost": sc,
-                "impact_cost": ic,
-                "borrow_cost": bc,
-                "total_cost":  total_cost,
-                "net_pnl":     net,
-                "turnover":    turnover,
-            })
+        short_notional = np.abs(np.minimum(pos_array, 0.0))
+        scalar_borrow_bps = self.cfg.get("borrow_cost_easy_bps", 0)
+        if borrow_bps_matrix is None:
+            borrow_cost = np.nansum(short_notional, axis=1) * (
+                scalar_borrow_bps / 10_000 / 252
+            )
+        else:
+            borrow_bps = borrow_bps_matrix.reindex(
+                index=pos.index, columns=pos.columns
+            ).fillna(scalar_borrow_bps)
+            borrow_cost = np.nansum(
+                short_notional * borrow_bps.to_numpy(dtype=float) / 10_000 / 252,
+                axis=1,
+            )
 
-        return pd.DataFrame(records).set_index("date")
+        total_cost = spread_cost + impact_cost + borrow_cost
+        net_pnl = gross - total_cost
+
+        return pd.DataFrame(
+            {
+                "gross_pnl": gross,
+                "spread_cost": spread_cost,
+                "impact_cost": impact_cost,
+                "borrow_cost": borrow_cost,
+                "total_cost": total_cost,
+                "net_pnl": net_pnl,
+                "turnover": turnover,
+            },
+            index=pd.Index(common_dates, name="date"),
+        )
 
     # ------------------------------------------------------------------
     # Performance metrics

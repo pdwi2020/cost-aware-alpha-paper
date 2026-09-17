@@ -36,6 +36,20 @@ sys.path.insert(0, str(ROOT))
 from src.models.model_suite import make_fold_dates
 from src.calibration.conformal import ConformalIntervals
 from src.features.feature_spec import feature_columns as _feature_columns
+from src.fdr.run_fdr import _is_calm_regime
+
+
+def _regime_masks(regime_values) -> tuple[np.ndarray, np.ndarray]:
+    """Split regime values into (calm, stressed) boolean masks.
+
+    Days whose regime cannot be classified belong to neither mask, so an
+    unparseable column yields two empty masks and a visibly missing result
+    rather than one bucket that silently holds the whole sample.
+    """
+    flags = [_is_calm_regime(v) for v in regime_values]
+    calm = np.array([f is True for f in flags], dtype=bool)
+    stressed = np.array([f is False for f in flags], dtype=bool)
+    return calm, stressed
 
 FEAT_PATH    = ROOT / "data" / "processed" / "features_all.parquet"
 OUT_COV      = ROOT / "data" / "processed" / "conformal_coverage.parquet"
@@ -154,15 +168,20 @@ def run_fold(
     q_stressed   = np.nan
 
     if regime_te is not None:
-        calm_m     = np.array([str(v).lower() == "calm" for v in regime_te])
-        stressed_m = ~calm_m
+        # regime_vix holds the VIX *level*, not a label, so the previous
+        # test str(v).lower() == "calm" was never true of "16.89": every day
+        # was classified stressed, the calm column was NaN for every fold, and
+        # the stressed column silently reproduced the overall coverage. This is
+        # the same defect that affected the regime FDR split, so it uses the
+        # same classifier. Days whose regime cannot be determined are excluded
+        # from both masks rather than being counted as stressed.
+        calm_m, stressed_m = _regime_masks(regime_te)
 
         # Regime-specific q_hat (calibrate on regime subsets of calibration data)
         regime_cal = df.loc[tr_valid, vix_col].values[-n_cal:] \
                   if vix_col in df.columns else None
         if regime_cal is not None:
-            calm_cal     = np.array([str(v).lower() == "calm" for v in regime_cal])
-            stressed_cal = ~calm_cal
+            calm_cal, stressed_cal = _regime_masks(regime_cal)
 
             for regime_m_cal, regime_m_te, attr in [
                 (calm_cal, calm_m, "calm"),
@@ -206,7 +225,12 @@ def main():
     t0 = time.time()
 
     log("Loading features_all.parquet …")
-    df = pd.read_parquet(FEAT_PATH)
+    # Lean load: the modelled columns plus the targets, s0_eligible and
+    # regime_vix (which this script uses for the regime coverage split).
+    # The full float64 panel drove this 8 GB machine into swap and was killed.
+    from src.data.lean_load import load_features_lean
+
+    df = load_features_lean(FEAT_PATH)
 
     fold_dates = make_fold_dates()
     cov_records  = []

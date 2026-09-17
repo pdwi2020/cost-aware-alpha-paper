@@ -59,7 +59,7 @@ from src.backtest.run_holdout import (
 )
 
 FEATURES_PATH = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH    = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH    = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH      = ROOT / "configs" / "backtest.yaml"
 MODEL_CFG     = ROOT / "configs" / "models.yaml"
 OUT_METRICS   = ROOT / "data" / "processed" / "ml_baseline_metrics.parquet"

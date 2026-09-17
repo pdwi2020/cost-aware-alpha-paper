@@ -2,11 +2,13 @@
 
 Single source-of-truth for all universe + liquidity screening.
 All filters are LAGGED: eligibility at date t depends only on data ≤ t-1
-(price/ADV) plus the annual PIT membership snapshot for year(t).
+(price/ADV and, when selected, daily PIT membership) or the annual PIT
+membership snapshot for year(t).
 
 Public API
 ----------
 pit_membership_mask(daily, sp500_dir)          -> pd.Series[bool] (ticker, date)
+pit_membership_mask_daily(daily, path)         -> pd.Series[bool] (ticker, date)
 trailing_adv_usd(daily, window=21)             -> pd.Series[float] (ticker, date)
 lagged_min_price(daily)                        -> pd.Series[float] (ticker, date)
 screen0_eligibility(daily, sp500_dir, ...)     -> pd.Series[bool]  (ticker, date)
@@ -114,9 +116,54 @@ def pit_membership_mask(
     pit = pit[["ticker", "date", "_member"]].drop_duplicates(["ticker", "date"])
 
     merged = df[["ticker", "date"]].merge(pit, on=["ticker", "date"], how="left")
-    merged["_member"] = merged["_member"].fillna(False)
+    merged["_member"] = merged["_member"].astype("boolean").fillna(False).astype(bool)
     merged = merged.set_index(["ticker", "date"])
     return merged["_member"].rename("pit_member")
+
+
+def pit_membership_mask_daily(
+    daily: pd.DataFrame,
+    membership_path: Union[str, Path],
+) -> pd.Series:
+    """One-trading-day-lagged point-in-time S&P 500 membership mask.
+
+    At date t, membership equals the same-day membership flag from ticker T's
+    immediately preceding row in `daily`.  The per-ticker shift mirrors
+    `lagged_min_price`, so the result uses membership known at the close of t-1
+    and is look-ahead free.  A ticker's first row is always a non-member because
+    it has no preceding row.
+
+    Parameters
+    ----------
+    daily           : long OHLCV frame; must have columns [ticker, date].
+    membership_path : parquet file with one [date, ticker] row per member day.
+
+    Returns
+    -------
+    pd.Series[bool] indexed by (ticker, date), named 'pit_member_daily_lag1'.
+    """
+    df = _ensure_long(daily)
+    membership = pd.read_parquet(membership_path, columns=["date", "ticker"])
+    membership["date"] = pd.to_datetime(membership["date"]).dt.normalize()
+    membership["_member"] = True
+    membership = membership[["ticker", "date", "_member"]].drop_duplicates(
+        ["ticker", "date"]
+    )
+
+    merged = df[["ticker", "date"]].merge(
+        membership, on=["ticker", "date"], how="left"
+    )
+    merged["_member"] = merged["_member"].astype("boolean").fillna(False).astype(bool)
+    merged = merged.sort_values(["ticker", "date"])
+    lagged = (
+        merged.groupby("ticker", group_keys=False)["_member"]
+        .transform(lambda s: s.shift(1))
+    )
+    merged["_member_lag1"] = lagged.astype("boolean").fillna(False).astype(bool)
+    return (
+        merged.set_index(["ticker", "date"])["_member_lag1"]
+        .rename("pit_member_daily_lag1")
+    )
 
 
 def trailing_adv_usd(
@@ -184,17 +231,25 @@ def screen0_eligibility(
     adv_window: int | None = None,
     universe: str = "pit",
     top_n: int | None = None,
+    granularity: str = "annual",
+    membership_daily_path: Union[str, Path, None] = None,
 ) -> pd.Series:
     """Compute Screen 0 eligibility flag for every (ticker, date) row.
 
     Eligibility at date t is determined ENTIRELY from data ≤ t-1 (price,
-    ADV) plus the annual PIT snapshot for year(t):
+    ADV) plus either the annual PIT snapshot for year(t) or daily membership
+    lagged by one row per ticker:
 
-        eligible_t = member_t AND (price[t-1] >= min_price)
-                                AND (adv_usd[t-1:t-window] >= min_adv)
+        eligible_t = member_as_of_t-1 AND (price[t-1] >= min_price)
+                                        AND (adv_usd[t-1:t-window] >= min_adv)
+
+    With the default `granularity='annual'`, annual snapshot membership is
+    used exactly as before.  With `granularity='daily'`, membership is read
+    from `membership_daily_path` and lagged one trading-day row per ticker.
 
     For `universe='liquidity'`, the PIT membership term is replaced by
-    top-`top_n` membership by trailing ADV (also lagged, also look-ahead free).
+    top-`top_n` membership by trailing ADV (also lagged, also look-ahead free),
+    and both PIT membership paths are ignored.
 
     Parameters
     ----------
@@ -207,6 +262,10 @@ def screen0_eligibility(
     universe   : 'pit' (default) or 'liquidity'.
     top_n      : for universe='liquidity', number of top-ADV names to admit
                  (default from spec.yaml: 500).
+    granularity: for universe='pit', 'annual' (default) uses `sp500_dir`, while
+                 'daily' uses one-row-lagged daily PIT membership.
+    membership_daily_path : parquet [date, ticker] membership file; required
+                            when universe='pit' and granularity='daily'.
 
     Returns
     -------
@@ -218,6 +277,11 @@ def screen0_eligibility(
     if adv_window is None: adv_window = _d_adv_window
     if top_n      is None: top_n      = _d_top_n
 
+    if granularity not in {"annual", "daily"}:
+        raise ValueError(
+            f"granularity must be 'annual' or 'daily', got {granularity!r}"
+        )
+
     # --- 1. ADV and lagged price (both look-ahead free) ---
     adv  = trailing_adv_usd(daily, window=adv_window)   # indexed (ticker, date)
     lpx  = lagged_min_price(daily)                       # indexed (ticker, date)
@@ -227,7 +291,14 @@ def screen0_eligibility(
 
     # --- 2. Universe membership ---
     if universe == "pit":
-        member = pit_membership_mask(daily, sp500_dir)
+        if granularity == "annual":
+            member = pit_membership_mask(daily, sp500_dir)
+        else:
+            if membership_daily_path is None:
+                raise ValueError(
+                    "membership_daily_path is required when granularity='daily'"
+                )
+            member = pit_membership_mask_daily(daily, membership_daily_path)
     elif universe == "liquidity":
         member = build_liquidity_universe(daily, top_n=top_n, adv_window=adv_window)
     else:

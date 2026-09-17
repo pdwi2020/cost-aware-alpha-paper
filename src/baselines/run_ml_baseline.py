@@ -77,7 +77,7 @@ from src.features.feature_spec import feature_columns as _feature_columns
 # Paths
 # ---------------------------------------------------------------------------
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 
 OUT_RETURNS = ROOT / "data" / "processed" / "ml_baseline_returns.parquet"
@@ -409,7 +409,10 @@ def main() -> None:
     log(f"  Locked OOS: {OOS_START} → {OOS_END}")
 
     log("\nLoading features_all.parquet …")
-    feat_df = pd.read_parquet(FEAT_PATH)
+    # Lean load: frozen-specification columns only (683 MB panel, 8 GB machine).
+    from src.data.lean_load import load_features_lean
+
+    feat_df = load_features_lean(FEAT_PATH)
     feat_df.index = feat_df.index.set_levels(
         [feat_df.index.levels[0], pd.to_datetime(feat_df.index.levels[1])]
     )

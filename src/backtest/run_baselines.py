@@ -49,7 +49,7 @@ sys.path.insert(0, str(ROOT))
 from src.backtest.portfolio import PortfolioSimulator
 from src.backtest.generate_signals import build_signal_weights, generate_composite_signal
 
-OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
 FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
 SHAP_PATH   = ROOT / "data" / "processed" / "shap_summary.parquet"
@@ -58,6 +58,34 @@ CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
 OUT_PNL     = ROOT / "data" / "processed" / "baselines_pnl.parquet"
 OUT_METRICS = ROOT / "data" / "processed" / "baselines_metrics.parquet"
+
+def _spy_returns() -> pd.Series:
+    """Daily SPY returns, derived from the same price panel as everything else.
+
+    This used to read a standalone `spy_returns.parquet`, a v2 side-artefact
+    that no longer exists, so the baseline stage died with FileNotFoundError
+    after every other stage had succeeded. SPY is a row in the v3 panel, so
+    deriving the series removes the dangling dependency and guarantees the
+    benchmark is on the same price basis, calendar and adjustment convention
+    as the strategies it is compared against.
+    """
+    ohlcv = pd.read_parquet(OHLCV_PATH, columns=["ticker", "date", "close"])
+    spy = ohlcv.loc[ohlcv["ticker"] == "SPY"].copy()
+    if spy.empty:
+        raise RuntimeError(
+            f"SPY not found in {OHLCV_PATH.name}; the buy-and-hold benchmark "
+            "cannot be constructed"
+        )
+    spy["date"] = pd.to_datetime(spy["date"])
+    s = (
+        spy.set_index("date")["close"]
+        .sort_index()
+        .pct_change(fill_method=None)
+        .dropna()
+    )
+    s.name = "spy_return"
+    return s
+
 
 IS_START  = "2013-01-01"; IS_END  = "2021-12-31"
 OOS_START = "2022-01-01"; OOS_END = "2024-12-31"
@@ -302,10 +330,7 @@ def main():
         )
 
         # ── 1. Buy-and-hold SPY ──────────────────────────────────────────
-        spy_df = pd.read_parquet(SPY_PATH)
-        spy_col = spy_df.columns[0]
-        spy_r = spy_df[spy_col].squeeze()
-        spy_r.index = pd.to_datetime(spy_r.index)
+        spy_r = _spy_returns()
         mask_spy = (spy_r.index >= pd.Timestamp(start)) & (spy_r.index <= pd.Timestamp(end))
         spy_slice = spy_r[mask_spy]
         spy_pnl = pd.DataFrame({

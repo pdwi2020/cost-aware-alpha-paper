@@ -75,7 +75,7 @@ from src.manifest import record as manifest_record
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 FDR_PATH   = ROOT / "data" / "processed" / "fdr_results.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 OUT_PATH   = ROOT / "data" / "processed" / "pbo_deployed.parquet"

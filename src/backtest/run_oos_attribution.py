@@ -53,7 +53,7 @@ from src.features.feature_spec import feature_columns as _feature_columns
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
 FDR_PATH   = ROOT / "data" / "processed" / "fdr_results.parquet"
 SHAP_PATH  = ROOT / "data" / "processed" / "shap_summary.parquet"
-OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 OUT        = ROOT / "data" / "processed" / "oos_attribution.parquet"
 

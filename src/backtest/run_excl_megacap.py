@@ -38,7 +38,7 @@ from src.backtest.generate_signals import build_signal_weights, generate_composi
 FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
 SHAP_PATH   = ROOT / "data" / "processed" / "shap_summary.parquet"
 FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
 OUT_METRICS = ROOT / "data" / "processed" / "excl_megacap_metrics.parquet"
@@ -138,7 +138,10 @@ def main():
     log(f"\n  Saved dropped list → {OUT_DROPPED}")
 
     log("\nLoading features_all.parquet (OOS slice) …")
-    feat_df = pd.read_parquet(FEAT_PATH)
+    # Lean load: frozen-specification columns only (683 MB panel, 8 GB machine).
+    from src.data.lean_load import load_features_lean
+
+    feat_df = load_features_lean(FEAT_PATH)
 
     # Filter feature panel: remove mega-cap tickers
     tickers_level = feat_df.index.get_level_values("ticker")
@@ -213,17 +216,21 @@ def main():
     out_df.to_parquet(OUT_METRICS, index=False)
     log(f"\nSaved → {OUT_METRICS}")
 
-    # Compare to full-universe benchmark
-    log("\n=== vs. full-universe benchmark ===")
+    # Compare to the full universe over THIS script's window. holdout_metrics.parquet
+    # holds the locked 2025 window, so reading it here differenced a 2022-2024
+    # sub-universe against a 2025 benchmark and printed a meaningless delta.
+    log(f"\n=== vs. full-universe benchmark ({HOLDOUT_START[:4]}-{HOLDOUT_END[:4]}) ===")
+    bench_path = (ROOT / "data" / "processed"
+                  / "holdout_metrics_exploratory_2022_2024.parquet")
     try:
-        bm = pd.read_parquet(ROOT / "data" / "processed" / "holdout_metrics.parquet")
+        bm = pd.read_parquet(bench_path)
         for track in ["track_a", "track_b"]:
             full_sr = float(bm[bm["track"] == track]["net_pnl_sharpe"].iloc[0])
             excl_sr = float(out_df[out_df["track"] == track]["net_pnl_sharpe"].iloc[0])
             delta   = excl_sr - full_sr
             log(f"  {track.upper()}: full={full_sr:+.3f}  ex-mega-cap={excl_sr:+.3f}  Δ={delta:+.3f}")
     except Exception as e:
-        log(f"  (benchmark comparison failed: {e})")
+        log(f"  (benchmark comparison against {bench_path.name} failed: {e})")
 
     log(f"\nTotal elapsed: {time.time()-t0:.1f}s")
 

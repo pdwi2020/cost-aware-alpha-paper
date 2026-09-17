@@ -36,7 +36,7 @@ from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
 SIG_A_PATH  = ROOT / "data" / "processed" / "signals_track_a.parquet"
 SIG_B_PATH  = ROOT / "data" / "processed" / "signals_track_b.parquet"
 FEAT_PATH   = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH    = ROOT / "configs" / "backtest.yaml"
 
 OUT_BASE    = ROOT / "data" / "processed" / "backtest_base.parquet"

@@ -35,7 +35,7 @@ from src.backtest.portfolio import PortfolioSimulator
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
 FDR_PATH   = ROOT / "data" / "processed" / "fdr_results.parquet"
 SHAP_PATH  = ROOT / "data" / "processed" / "shap_summary.parquet"
-OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 OUT        = ROOT / "data" / "processed" / "ablation_oos.parquet"
 
@@ -106,7 +106,11 @@ def main():
 
     fdr_df  = pd.read_parquet(FDR_PATH)
     shap_df = pd.read_parquet(SHAP_PATH)
-    feat_df = pd.read_parquet(FEAT_PATH)
+    # Lean load: the frozen-specification columns only. The full float64 panel
+    # is 683 MB on disk and drove this 8 GB machine into swap.
+    from src.data.lean_load import load_features_lean
+
+    feat_df = load_features_lean(FEAT_PATH)
     ohlcv   = pd.read_parquet(OHLCV_PATH)
 
     # Normalise index
@@ -228,6 +232,9 @@ def main():
         )
         m = sim.compute_metrics(pnl)
         res = {
+            # The track was implicit in this file, so a consumer had to know
+            # that TRACK is track_b to interpret the rows. Make it explicit.
+            "track":     TRACK,
             "variant":   label,
             "n_features": len(available),
             "gross_sr":  m.get("gross_pnl_sharpe", np.nan),

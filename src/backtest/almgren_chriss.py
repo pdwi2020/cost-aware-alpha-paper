@@ -1,4 +1,4 @@
-"""Almgren-Chriss (2001) square-root market impact model."""
+"""Execution costs using a square-root participation impact model."""
 
 import numpy as np
 import pandas as pd
@@ -10,7 +10,7 @@ def compute_impact_cost(
     vol: float,
     impact_coeff: float = 0.10,
 ) -> float:
-    """Square-root market impact cost per unit of order size.
+    """Square-root participation impact cost per unit of order size.
 
     Cost per share = impact_coeff * vol * sqrt(order_size / ADV)
 
@@ -29,13 +29,17 @@ def compute_impact_cost(
 
 
 def compute_spread_cost(spread_bps: float = 3.0) -> float:
-    """Round-trip spread cost as fraction of price.
+    """Cost per unit of one-way portfolio-weight turnover.
+
+    ``spread_bps`` is the half-spread in basis points. A full round trip pays
+    this cost twice, once when buying and once when later selling, because the
+    simulator charges every day's absolute change in portfolio weight.
 
     Args:
-        spread_bps: Bid-ask spread in basis points (default 3).
+        spread_bps: Half-spread in basis points (default 3).
 
     Returns:
-        Round-trip cost as fraction (spread_bps / 10000).
+        Cost per unit of one-way turnover (spread_bps / 10000).
     """
     return spread_bps / 10_000
 
@@ -71,9 +75,11 @@ def compute_total_cost(
     impact_coeff: float = 0.10,
     borrow_tier: str = "easy",
 ) -> float:
-    """Total round-trip execution cost: spread + impact + borrow.
+    """Total cost associated with one-way turnover: spread + impact + borrow.
 
-    Returns cost as fraction of notional traded (always ≥ 0).
+    The spread and impact components apply to a trade on a given day, while
+    borrow applies to the short position held that day. Returns cost as a
+    fraction of notional (always ≥ 0).
     """
     spread = compute_spread_cost(spread_bps)
     impact = compute_impact_cost(order_size, adv, vol, impact_coeff)

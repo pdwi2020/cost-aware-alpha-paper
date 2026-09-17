@@ -31,17 +31,19 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+import src.manifest as manifest
 from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
 from src.backtest.run_backtest import build_returns_vol_adv
 
 SIG_A_PATH = ROOT / "data" / "processed" / "signals_track_a.parquet"
 SIG_B_PATH = ROOT / "data" / "processed" / "signals_track_b.parquet"
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
-OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv.parquet"
+OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 
 OUT_3D   = ROOT / "data" / "processed" / "sensitivity_3d.parquet"
 OUT_SUMM = ROOT / "data" / "processed" / "sensitivity_summary.parquet"
+OUT_ARV  = ROOT / "data" / "processed" / "sensitivity_arv.parquet"
 
 BACKTEST_START = "2013-01-01"
 BACKTEST_END   = "2021-12-31"
@@ -191,8 +193,43 @@ def main():
         log(profitable.round(3).to_string(index=False))
 
     pareto_df.to_parquet(OUT_SUMM, index=False)
+
+    # ── Alpha Robustness Volume ───────────────────────────────────────────────
+    # The paper reports ARV and recommends it to practitioners, so it is
+    # computed here from the grid rather than asserted in the text.
+    from src.backtest.arv import DEFAULT_THRESHOLDS, arv_report
+
+    log(f"\n{'='*60}")
+    log("  ALPHA ROBUSTNESS VOLUME (fraction of the cost grid above a threshold)")
+    log(f"{'='*60}")
+    arv_rows = []
+    for track in sorted(df["track"].unique()):
+        rep = arv_report(df, track)
+        arv_rows.append(rep)
+        log(f"  {track}: {rep['n_configs']}/{rep['n_configs_total']} configs, "
+            f"net SR min {rep['sharpe_min']:+.3f} / median {rep['sharpe_median']:+.3f} "
+            f"/ max {rep['sharpe_max']:+.3f}")
+        log("    " + "  ".join(
+            f"ARV({k})={100*v:.0f}%" for k, v in rep["arv"].items()
+        ))
+        for k, v in rep["arv"].items():
+            manifest.record(
+                f"sensitivity.{track}.arv_{k.replace('.', 'p')}", float(v),
+                stage="sensitivity", track=track.split("_")[1].upper(),
+                meta={"threshold": float(k), "n_configs": rep["n_configs"],
+                      "definition": "fraction of cost-grid configs with net "
+                                    "annualised Sharpe strictly above threshold"},
+            )
+
+    pd.DataFrame([
+        {"track": r["track"], "threshold": float(k), "arv": v,
+         "n_configs": r["n_configs"]}
+        for r in arv_rows for k, v in r["arv"].items()
+    ]).to_parquet(OUT_ARV, index=False)
+
     log(f"\nSaved → {OUT_3D}")
     log(f"Saved → {OUT_SUMM}")
+    log(f"Saved → {OUT_ARV}")
     log(f"Total elapsed: {time.time()-t0:.1f}s")
 
 

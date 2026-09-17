@@ -108,11 +108,23 @@ def _compute_rolling_beta(
 
 
 def _sanitize_ohlcv_for_tier2(daily: pd.DataFrame, cap: float) -> pd.DataFrame:
-    """Replace `close` in OHLCV with a sanitized proxy for Tier-2 feature building.
+    """Winsorise the daily bar for Tier-2 feature building.
 
     Used specifically for overnight_gap (open_T / close_{T-1} - 1) in Tier-2.
     The original `close` is replaced with close_clean = first × cumprod(1 + r_clean)
     where r_clean = clip(pct_change(close), -cap, +cap).
+
+    The WHOLE bar is rescaled by the per-day factor close_clean / close_raw, not
+    just the close. Rebasing the close alone leaves `open` on the original price
+    basis, so from the first clipped day onward every later overnight_gap for
+    that ticker is multiplied by a constant: WY has one clipped day (its 2010
+    REIT-conversion distribution) and close_clean/close_raw settles at 1.3121,
+    which put a spurious -23.8% overnight gap on every subsequent day, constant
+    to four decimals, and made WY a permanent extreme of the cross-section.
+    VRTX picked up +11.8% the same way. Tickers with no clipped day (AAPL, XOM)
+    were exact, which is why the defect was invisible in aggregate. Scaling the
+    bar keeps every intraday relationship (open/close, high/low) intact while
+    still removing the return outlier the cap is there to remove.
 
     ADV / dollar-volume computations in crowding features also use close × volume,
     but those are structural features (not return-derived) so raw close is acceptable;
@@ -130,27 +142,37 @@ def _sanitize_ohlcv_for_tier2(daily: pd.DataFrame, cap: float) -> pd.DataFrame:
     close_clean_w = growth.multiply(first_close, axis="columns")
     close_clean_w[close_w.isna()] = np.nan
 
-    # Long-format merge
-    cc_long = (
-        close_clean_w.stack(future_stack=True)
-        .rename("close_clean")
-        .reset_index()
-    )
-    cc_long.columns = ["date", "ticker", "close_clean"]
-    cc_long["date"] = pd.to_datetime(cc_long["date"])
-    daily = daily.merge(cc_long, on=["ticker", "date"], how="left")
+    factor_w = (close_clean_w / close_w).replace([np.inf, -np.inf], np.nan)
+
+    long_parts = {}
+    for name, wide in (("close_clean", close_clean_w), ("_bar_factor", factor_w)):
+        s = wide.stack(future_stack=True).rename(name).reset_index()
+        s.columns = ["date", "ticker", name]
+        s["date"] = pd.to_datetime(s["date"])
+        long_parts[name] = s
+
+    daily = daily.merge(long_parts["close_clean"], on=["ticker", "date"], how="left")
+    daily = daily.merge(long_parts["_bar_factor"], on=["ticker", "date"], how="left")
+
+    # Carry open/high/low onto the same basis as the sanitised close.
+    for col in ("open", "high", "low"):
+        if col in daily.columns:
+            daily[col] = daily[col] * daily["_bar_factor"]
+
     daily.rename(columns={"close": "close_raw", "close_clean": "close"}, inplace=True)
-    return daily
+    return daily.drop(columns=["_bar_factor"])
 
 CATALOG      = os.environ.get("DUCKDB_CATALOG", "/Volumes/Crucial X9/data/catalog.duckdb")
 SP500_DIR    = ROOT / "datasets" / "sp500_holdings"
 OUT_DIR      = ROOT / "data" / "processed"
 TIER1_PATH   = OUT_DIR / "features_tier1.parquet"
-OHLCV_PATH   = OUT_DIR / "daily_ohlcv.parquet"
+OHLCV_PATH   = OUT_DIR / "daily_ohlcv_v3.parquet"   # v3 hybrid panel
 OUT_PATH     = OUT_DIR / "features_all.parquet"
 
 UNIVERSE_START = "2010-01-01"
-UNIVERSE_END   = "2025-08-01"   # extended for the locked 2025 OOS window
+# v3: build features over all available data; the forward window is sealed for
+# EVALUATION by config/spec.yaml, not by truncating the panel.
+UNIVERSE_END   = "2026-09-14"
 
 
 def main() -> pd.DataFrame:
@@ -184,9 +206,10 @@ def main() -> pd.DataFrame:
     #    Sanitize close prices for Tier-2 feature building so overnight_gap
     #    uses the same artifact-free price series as Tier-1 features.
     # ------------------------------------------------------------------
-    print("Loading daily OHLCV...")
-    daily = pd.read_parquet(OHLCV_PATH)
-    daily["date"] = pd.to_datetime(daily["date"])
+    print("Loading daily OHLCV (v3 hybrid panel)...")
+    from src.data import universe_v3
+
+    daily = universe_v3.load_panel(UNIVERSE_START, UNIVERSE_END)
     print(f"  OHLCV shape: {daily.shape}")
     print(f"  Sanitizing OHLCV for Tier-2 (cap=±{SANITIZE_CAP_T2:.0%}) ...")
     daily = _sanitize_ohlcv_for_tier2(daily, SANITIZE_CAP_T2)
@@ -195,8 +218,8 @@ def main() -> pd.DataFrame:
     # ------------------------------------------------------------------
     # 3. SP500 universe tickers
     # ------------------------------------------------------------------
-    sp500_tickers = get_universe_tickers(str(SP500_DIR))
-    print(f"  SP500 union tickers: {len(sp500_tickers)}")
+    sp500_tickers = universe_v3.pit_tickers(UNIVERSE_START, UNIVERSE_END)
+    print(f"  PIT members (daily membership): {len(sp500_tickers)}")
 
     # ------------------------------------------------------------------
     # 4. Build Tier 2 features
@@ -210,7 +233,6 @@ def main() -> pd.DataFrame:
         daily_ohlcv=daily,
         start_date=UNIVERSE_START,
         end_date=UNIVERSE_END,
-        intraday_batch_size=150,
         crowding_window=20,
     )
     print(f"\nTier 2 total time: {time.time()-t0:.0f}s  →  {tier2.shape}")

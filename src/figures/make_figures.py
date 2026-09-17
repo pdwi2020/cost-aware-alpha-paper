@@ -9,6 +9,7 @@ Figures:
      (manifest numbers: +0.188 / −0.61 / +0.666 p=0.62 n.s.)
   5. Track A signal IC decay by holding period (ic_by_fold ensemble IC + OHLCV)
   6. Track A SHAP feature importance, BH-significant features highlighted
+  7. Regime-signal net SR bar chart (reads pre-computed regime_signal_results.parquet)
 
 Run:
     python3 -m src.figures.make_figures
@@ -33,7 +34,51 @@ ROOT    = Path(__file__).resolve().parent.parent.parent
 FIG_DIR = ROOT / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
+# Submission copies go here (PDF + 600-dpi PNG + SVG, journal-named)
+SUBM_DIR = ROOT / "paper" / "figures_submission"
+SUBM_DIR.mkdir(parents=True, exist_ok=True)
+
 PROC = ROOT / "data" / "processed"
+
+# Mapping: figure stem → submission base name (no extension)
+SUBM_NAMES = {
+    "fig1_cumulative_pnl":    "Fig1_CumulativePnL",
+    "fig2_sensitivity_heatmap": "Fig2_Sensitivity",
+    "fig3_conformal_coverage":  "Fig3_ConformalCoverage",
+    "fig4_is_oos_comparison":   "Fig4_ISOOS",
+    "fig5_signal_decay":        "Fig5_SignalDecay",
+    "fig6_shap_importance":     "Fig6_SHAP",
+    "fig7_regime_signal":       "Fig7_RegimeSignal",
+}
+
+
+def save_all_formats(fig, stem: str, outdir: Path = FIG_DIR):
+    """Save figure as PDF (vector), 600-dpi PNG, and SVG in outdir.
+
+    Also writes submission-named copies (PDF + PNG + SVG) to SUBM_DIR if the
+    stem is in SUBM_NAMES.  The canonical PNG at dpi=600 in outdir preserves
+    the existing filename so paper/main.tex references continue to resolve.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # --- Primary output dir ---
+    png_path = outdir / f"{stem}.png"
+    pdf_path = outdir / f"{stem}.pdf"
+    svg_path = outdir / f"{stem}.svg"
+
+    fig.savefig(png_path, dpi=600, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")   # vector; dpi irrelevant for PDF
+    fig.savefig(svg_path, bbox_inches="tight")
+    print(f"  Saved: {png_path} (600 dpi)  {pdf_path} (PDF)  {svg_path} (SVG)")
+
+    # --- Submission copies ---
+    subm_base = SUBM_NAMES.get(stem)
+    if subm_base:
+        SUBM_DIR.mkdir(parents=True, exist_ok=True)
+        fig.savefig(SUBM_DIR / f"{subm_base}.pdf", bbox_inches="tight")
+        fig.savefig(SUBM_DIR / f"{subm_base}.png", dpi=600, bbox_inches="tight")
+        fig.savefig(SUBM_DIR / f"{subm_base}.svg", bbox_inches="tight")
+        print(f"  Submission: {SUBM_DIR}/{subm_base}.[pdf|png|svg]")
 
 plt.rcParams.update({
     "font.family":     "DejaVu Sans",
@@ -89,10 +134,8 @@ def fig_cumulative_pnl():
             bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8))
 
     plt.tight_layout()
-    path = FIG_DIR / "fig1_cumulative_pnl.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    save_all_formats(fig, "fig1_cumulative_pnl")
     plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -155,10 +198,8 @@ def fig_sensitivity_heatmap():
     fig.suptitle("Track A — IS Net Sharpe vs Cost Parameters & Rebalancing Frequency",
                  fontsize=11)
     plt.tight_layout()
-    path = FIG_DIR / "fig2_sensitivity_heatmap.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    save_all_formats(fig, "fig2_sensitivity_heatmap")
     plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -203,32 +244,54 @@ def fig_conformal_coverage():
             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9))
 
     plt.tight_layout()
-    path = FIG_DIR / "fig3_conformal_coverage.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    save_all_formats(fig, "fig3_conformal_coverage")
     plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────────
-# Figure 4: Multi-window Track A net Sharpe — centerpiece figure
-# Numbers from manifest (not fabricated):
-#   IS 2013–21 weekly   : +0.188   (manifest: battery.sensitivity.track_a.weekly_base_net_sharpe)
-#   Exploratory 2022–24 : −0.607   (manifest: synthesis.track_a.exploratory_2022_2024_net_sharpe)
-#   Locked OOS 2025     : +0.666   (manifest: oos.track_a.net_sharpe), p=0.62 n.s.
-# Source: holdout_metrics.parquet for OOS; manifest values hard-coded from
-#   results/manifest/manifest.json (spec_hash bcd59c0)
+# Figure 4: Multi-window Track A net Sharpe, the centerpiece figure.
+#
+# The values are READ from results/manifest/manifest.json at render time. They
+# used to be a hard-coded list with a comment saying "numbers from manifest
+# (not fabricated)", which was true when written and silently false afterwards:
+# the constants stayed pinned to the Array-era spec hash while the pipeline was
+# re-run, so the figure would have contradicted the tables in its own paper.
+# A missing key now raises instead of falling back to a stale constant.
 # ─────────────────────────────────────────────────────────────────
+
+def _manifest_value(key: str):
+    """Read one manifest scalar, raising if it is absent.
+
+    Silence here is the failure mode that matters: a figure that quietly keeps
+    a previous run's number is worse than one that does not render.
+    """
+    import json
+
+    path = ROOT / "results" / "manifest" / "manifest.json"
+    entry = json.loads(path.read_text()).get(key)
+    if entry is None:
+        raise KeyError(
+            f"manifest key {key!r} is missing from {path}; rerun the stage that "
+            "records it rather than hard-coding the value here"
+        )
+    return entry.get("value") if isinstance(entry, dict) else entry
+
 
 def fig_is_oos_comparison():
-    # Manifest-confirmed numbers (spec_hash bcd59c087aeb559f371936cfb0aa47f280298b63)
+    is_sr = float(_manifest_value("synthesis.track_a.is_net_sharpe_weekly"))
+    expl_sr = float(_manifest_value("synthesis.track_a.exploratory_2022_2024_net_sharpe"))
+    oos_sr = float(_manifest_value("oos.track_a.net_sharpe"))
+    oos_t = float(_manifest_value("oos.track_a.net_sharpe_tstat"))
+    oos_p = float(_manifest_value("oos.track_a.net_sharpe_pvalue"))
+    oos_n = int(_manifest_value("oos.track_a.n_days"))
+
     windows = [
         "IS 2013–21\n(weekly)",
         "Exploratory\n2022–24",
         "Locked OOS 2025\n(Jan–Jul)",
     ]
-    net_sharpes = [0.188, -0.607, 0.666]
-    # p-value annotation for OOS only
-    p_annot = [None, None, "t=0.50, p=0.62\n(n.s., n=144d)"]
+    net_sharpes = [is_sr, expl_sr, oos_sr]
+    p_annot = [None, None, f"t={oos_t:.2f}, p={oos_p:.2f}\n(n.s., n={oos_n}d)"]
 
     bar_colors = [
         COLORS["track_a"] if v >= 0 else COLORS["neg"]
@@ -242,8 +305,9 @@ def fig_is_oos_comparison():
                   edgecolor="black", linewidth=0.8, width=0.5)
     ax.axhline(0, color="black", lw=1.0)
     ax.set_ylabel("Track A Net Sharpe Ratio")
-    ax.set_title("CAVAL Track A — Net Sharpe Across Evaluation Windows\n"
-                 "(IS weekly rebal, +0.188; exploratory −0.61; locked OOS +0.67 n.s.)")
+    ax.set_title("CAVAL Track A: Net Sharpe Across Evaluation Windows\n"
+                 f"(IS weekly rebal, {is_sr:+.3f}; exploratory {expl_sr:+.2f}; "
+                 f"locked OOS {oos_sr:+.2f} n.s.)")
     ax.set_ylim(min(net_sharpes) - 0.25, max(net_sharpes) + 0.45)
     ax.grid(True, alpha=0.3, axis="y")
 
@@ -269,10 +333,8 @@ def fig_is_oos_comparison():
             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9))
 
     plt.tight_layout()
-    path = FIG_DIR / "fig4_is_oos_comparison.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    save_all_formats(fig, "fig4_is_oos_comparison")
     plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -290,7 +352,7 @@ def fig_signal_decay():
 
     # ── Attempt horizon curve from OHLCV + Track A signals ──────────
     sig_path = PROC / "signals_track_a.parquet"
-    ohlcv_path = PROC / "daily_ohlcv.parquet"
+    ohlcv_path = PROC / "daily_ohlcv_v3.parquet"
     horizon_computed = False
     horizon_results = {}
 
@@ -383,10 +445,8 @@ def fig_signal_decay():
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9))
 
     plt.tight_layout()
-    path = FIG_DIR / "fig5_signal_decay.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    save_all_formats(fig, "fig5_signal_decay")
     plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -438,10 +498,63 @@ def fig_shap_importance():
             bbox=dict(boxstyle="round,pad=0.3", facecolor="mistyrose", alpha=0.9))
 
     plt.tight_layout()
-    path = FIG_DIR / "fig6_shap_importance.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    save_all_formats(fig, "fig6_shap_importance")
     plt.close(fig)
-    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Figure 7: Regime-signal net SR bar chart
+# Source: regime_signal_results.parquet (pre-computed by run_regime_signal.py)
+# Reproduces the plot_results() logic from run_regime_signal.py without
+# re-running the heavy signal-construction pipeline.
+# ─────────────────────────────────────────────────────────────────
+
+def fig_regime_signal():
+    res_path = PROC / "regime_signal_results.parquet"
+    if not res_path.exists():
+        print(f"  SKIP fig7: {res_path} not found — run src/backtest/run_regime_signal.py first")
+        return
+
+    df = pd.read_parquet(res_path)
+
+    VARIANTS = ["static", "regime_adaptive", "calm_only", "stressed_only"]
+    years = ["2022", "2023", "2024", "OOS (2022-24)"]
+    x = np.arange(len(years))
+    width = 0.18
+
+    colors = {
+        "static":           "#1f77b4",
+        "regime_adaptive":  "#ff7f0e",
+        "calm_only":        "#2ca02c",
+        "stressed_only":    "#d62728",
+    }
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
+
+    for ax_i, track in enumerate(["track_a", "track_b"]):
+        ax = axes[ax_i]
+        sub = df[df["track"] == track]
+        for v_i, variant in enumerate(VARIANTS):
+            vs = sub[sub["variant"] == variant]
+            vals = []
+            for yr in years:
+                row = vs[vs["period"] == yr]
+                vals.append(float(row["net_sr"].iloc[0]) if len(row) > 0 else np.nan)
+            offset = (v_i - 1.5) * width
+            ax.bar(x + offset, vals, width, label=variant,
+                   color=colors[variant], alpha=0.85)
+
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.set_title(f"{track.upper()} — Regime Signal Variants", fontsize=11)
+        ax.set_xticks(x)
+        ax.set_xticklabels(years, fontsize=9)
+        ax.set_ylabel("Net Sharpe Ratio")
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    save_all_formats(fig, "fig7_regime_signal")
+    plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -469,9 +582,17 @@ def main():
     print("Figure 6: Track A SHAP importance ...")
     fig_shap_importance()
 
+    print("Figure 7: Regime-signal net SR bar chart ...")
+    fig_regime_signal()
+
     print(f"\nAll figures saved to: {FIG_DIR}/")
-    figs = sorted(FIG_DIR.glob("fig[1-6]*.png"))
+    figs = sorted(FIG_DIR.glob("fig[1-7]*.png"))
     for f in figs:
+        print(f"  {f.name}  ({f.stat().st_size // 1024} KB)")
+
+    print(f"\nSubmission copies in: {SUBM_DIR}/")
+    subm_figs = sorted(SUBM_DIR.glob("Fig*.pdf"))
+    for f in subm_figs:
         print(f"  {f.name}  ({f.stat().st_size // 1024} KB)")
 
 

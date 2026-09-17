@@ -190,7 +190,146 @@ HEADLINE_ASSERTIONS = [
      r"TA-FDR rejections\s*\(Track~A\).*?(\d+)\s*/\s*(\d+)"),
     ("TA-FDR rejections (Track B)", "tafdr.track_b.n_selected_bh", None,
      r"TA-FDR rejections\s*\(Track~B\).*?(\d+)\s*/\s*(\d+)"),
+    # Regime rows of tab:regime_fdr. These went to print computed over an empty
+    # calm sub-sample, because nothing tied the table to an authoritative
+    # source. Each row is now pinned to the manifest. The regex reads the
+    # "<n features> & <BH-rejected>" pair from the row, so group 1 is the
+    # DENOMINATOR and group 2 the rejection count; hence the swapped order.
+    ("Regime BH (Track A, calm)", "fdr.track_a.regime.calm.n_selected_bh", None,
+     r"Track~A\s*&\s*Calm\s*\(VIX\$\\leq\s*20\$\)\s*&\s*(\d+)\s*&\s*(\d+)",
+     "swapped"),
+    ("Regime BH (Track A, stressed)", "fdr.track_a.regime.stressed.n_selected_bh", None,
+     r"Track~A\s*&\s*Stressed\(VIX\$>\s*20\$\)\s*&\s*(\d+)\s*&\s*(\d+)",
+     "swapped"),
+    ("Regime BH (Track B, calm)", "fdr.track_b.regime.calm.n_selected_bh", None,
+     r"Track~B\s*&\s*Calm\s*\(VIX\$\\leq\s*20\$\)\s*&\s*(\d+)\s*&\s*(\d+)",
+     "swapped"),
+    ("Regime BH (Track B, stressed)", "fdr.track_b.regime.stressed.n_selected_bh", None,
+     r"Track~B\s*&\s*Stressed\(VIX\$>\s*20\$\)\s*&\s*(\d+)\s*&\s*(\d+)",
+     "swapped"),
 ]
+
+
+# Headline *magnitudes*, as opposed to the rejection counts above. These are
+# what drifted between the Array submission and its tables: a Sharpe ratio
+# quoted in three places, updated in one. Each entry is
+# (label, manifest key, subpath, regex capturing the number, decimals).
+# The manuscript value is compared to the manifest value rounded to the same
+# number of decimals, so "-0.196" matches -0.19625805.
+SCALAR_ASSERTIONS = [
+    ("IS net Sharpe (weekly, deployed)",
+     "backtest.track_a.is_net_sharpe_weekly", None,
+     r"IS net Sharpe is~\$\+([0-9.]+)\$", 3),
+    ("IS gross Sharpe (weekly)",
+     "backtest.track_a.is_gross_sharpe_weekly", None,
+     r"IS net Sharpe is~\$\+[0-9.]+\$ \(gross~\$\+([0-9.]+)\$\)", 3),
+    ("Exploratory 2022-2024 net Sharpe",
+     "window.exploratory_2022_2024.track_a.net_sharpe", None,
+     r"exploratory 2022--2024 window returns a net Sharpe of~\$\\mathbf\{(-[0-9.]+)\}\$", 3),
+    ("Locked OOS 2025 net Sharpe",
+     "window.locked_oos_2025.track_a.net_sharpe", None,
+     r"locked OOS net Sharpe of~\$(-[0-9.]+)\$\s*\n?cannot be distinguished", 3),
+    ("Locked OOS 2025 bootstrap p",
+     "window.locked_oos_2025.track_a.net_sharpe_boot_p", None,
+     r"\$t = -[0-9.]+\$, \$p = ([0-9.]+)\$\)", 2),
+    ("Locked OOS 2025 CI lower",
+     "window.locked_oos_2025.track_a.net_sharpe_ci95_lo", None,
+     r"The 95\\% interval runs from~\$(-[0-9.]+)\$", 2),
+    ("Locked OOS 2025 CI upper",
+     "window.locked_oos_2025.track_a.net_sharpe_ci95_hi", None,
+     r"The 95\\% interval runs from~\$-[0-9.]+\$\s*\n?to~\$\+([0-9.]+)\$", 2),
+    ("Selection-path PBO",
+     "pbo_selection_path.track_a.selection_path_54.pbo", None,
+     r"A PBO of \$([0-9.]+)\$ sits", 3),
+    ("Selection-path PBO (results section)",
+     "pbo_selection_path.track_a.selection_path_54.pbo", None,
+     r"\\PBO = \\mathbf\{([0-9.]+)\}\$: the IS-best", 3),
+    ("Deployed DSR",
+     "pbo_selection_path.track_a.selection_path_54.deployed_dsr", None,
+     r"Deflated Sharpe Ratio of~\$([0-9.]+)\$ at the", 3),
+    ("Ex-mega-cap exploratory net Sharpe",
+     "battery.excl_megacap.track_a.oos_net_sharpe", None,
+     r"ex-mega-cap~\$(-[0-9.]+)\$,\s*\n?mega-cap-only", 3),
+    ("Forward window net Sharpe",
+     "forward.track_a.net_sharpe", None,
+     r"returns a net Sharpe of\s*\n?\$\\mathbf\{(-[0-9.]+)\}\$ \(gross", 3),
+    ("Forward window days",
+     "forward.track_a.n_days", None,
+     r"Over ([0-9]+) trading days the frozen composite", 0),
+    ("Ensemble IC (Track A)",
+     "models.track_a.ensemble_ic_mean", None,
+     r"ensemble averages \$\\mathbf\{([0-9.]+)\}\$ across the", 3),
+
+    # tab:rebal. Every cell of this table was hand-typed and every cell drifted:
+    # it still held pre-correction values after two full re-runs, while the
+    # prose around it had been updated. Anchor each row on its own manifest key.
+    ("tab:rebal daily turnover",
+     "backtest.track_a.is_annual_turnover_daily", None,
+     r"Daily  \(1d\) & ([0-9.]+) &", 1),
+    ("tab:rebal daily gross Sharpe",
+     "backtest.track_a.is_gross_sharpe_daily", None,
+     r"Daily  \(1d\) & [0-9.]+ & \$\+([0-9.]+)\$", 3),
+    ("tab:rebal daily net Sharpe",
+     "backtest.track_a.is_net_sharpe_daily", None,
+     r"Daily  \(1d\) & [0-9.]+ & \$\+[0-9.]+\$ & \$\+([0-9.]+)\$", 3),
+    ("tab:rebal weekly turnover",
+     "backtest.track_a.is_annual_turnover_weekly", None,
+     r"Weekly \(5d\) & ([0-9.]+) &", 1),
+    ("tab:rebal weekly gross Sharpe",
+     "backtest.track_a.is_gross_sharpe_weekly", None,
+     r"Weekly \(5d\) & [0-9.]+ & \$\\mathbf\{\+([0-9.]+)\}\$", 3),
+    ("tab:rebal weekly net Sharpe",
+     "backtest.track_a.is_net_sharpe_weekly", None,
+     r"Weekly \(5d\) & [0-9.]+ & \$\\mathbf\{\+[0-9.]+\}\$ & \$\\mathbf\{\+([0-9.]+)\}\$", 3),
+    ("tab:rebal monthly turnover",
+     "backtest.track_a.is_annual_turnover_monthly", None,
+     r"Monthly\(21d\)& ([0-9.]+) &", 1),
+    ("tab:rebal monthly gross Sharpe",
+     "backtest.track_a.is_gross_sharpe_monthly", None,
+     r"Monthly\(21d\)& [0-9.]+ & \$\+([0-9.]+)\$", 3),
+    ("tab:rebal monthly net Sharpe",
+     "backtest.track_a.is_net_sharpe_monthly", None,
+     r"Monthly\(21d\)& [0-9.]+ & \$\+[0-9.]+\$ & \$\+([0-9.]+)\$", 3),
+
+    # tab:funnel. Same failure: the BHY row sat at 12 after the corr_* fix took
+    # it to 13, and the search-adjusted row at 15 after it took 16.
+    ("tab:funnel BH row (Track A)",
+     "fdr.track_a.n_selected_bh", None,
+     r"Screen 1: BH on daily cross-sectional IC  & ([0-9]+) &", 0),
+    ("tab:funnel BH row (Track B)",
+     "fdr.track_b.n_selected_bh", None,
+     r"Screen 1: BH on daily cross-sectional IC  & [0-9]+ & ([0-9]+)", 0),
+    ("tab:funnel BHY row (Track A)",
+     "fdr.track_a.n_selected_bhy", None,
+     r"\\quad under BHY \(dependence-robust\)       & ([0-9]+) &", 0),
+    ("tab:funnel BHY row (Track B)",
+     "fdr.track_b.n_selected_bhy", None,
+     r"\\quad under BHY \(dependence-robust\)       & [0-9]+ & ([0-9]+)", 0),
+]
+
+
+def check_scalar_assertions(
+    tex_text: str, manifest: dict
+) -> list[tuple[str, str, str]]:
+    """Cross-check headline magnitudes in the manuscript against the manifest."""
+    results: list[tuple[str, str, str]] = []
+    for label, key, sub, pattern, decimals in SCALAR_ASSERTIONS:
+        expected = _manifest_number(manifest, key, sub)
+        if expected is None:
+            results.append((label, "WARN", f"manifest key '{key}' absent"))
+            continue
+        m = re.search(pattern, tex_text)
+        if not m:
+            results.append((label, "WARN", "anchor not found in manuscript"))
+            continue
+        shown = float(m.group(1))
+        target = round(float(expected), decimals)
+        detail = f"manuscript shows {shown}, manifest says {target}"
+        if abs(shown - target) > 10 ** (-decimals) / 2:
+            results.append((label, "FAIL", detail))
+        else:
+            results.append((label, "PASS", detail))
+    return results
 
 
 def _feature_count(manifest: dict):
@@ -213,7 +352,11 @@ def check_headline_assertions(
     """
     results: list[tuple[str, str, str]] = []
     n_features = _feature_count(manifest)
-    for label, key, sub, pattern in HEADLINE_ASSERTIONS:
+    for assertion in HEADLINE_ASSERTIONS:
+        # A fifth element "swapped" marks a row whose regex captures the
+        # denominator first (the regime table prints "n features & rejected").
+        label, key, sub, pattern = assertion[:4]
+        swapped = len(assertion) > 4 and assertion[4] == "swapped"
         expected = _manifest_number(manifest, key, sub)
         if expected is None:
             results.append((label, "WARN", f"manifest key '{key}' absent"))
@@ -223,13 +366,14 @@ def check_headline_assertions(
         if not m:
             results.append((label, "WARN", "anchor not found in manuscript"))
             continue
-        shown_num = int(m.group(1))
+        num_group, den_group = (2, 1) if swapped else (1, 2)
+        shown_num = int(m.group(num_group))
         detail = f"manuscript shows {shown_num}, manifest says {expected}"
         if shown_num != expected:
             results.append((label, "FAIL", detail))
             continue
         if m.lastindex and m.lastindex >= 2 and n_features is not None:
-            shown_den = int(m.group(2))
+            shown_den = int(m.group(den_group))
             if shown_den != n_features:
                 results.append((
                     label, "FAIL",
@@ -321,13 +465,14 @@ def main() -> int:
     # --- Headline assertion cross-checks (hard guard against manifest drift) ---
     manifest_raw = load_manifest_raw(args.manifest)
     tex_text = args.tex.read_text(encoding="utf-8", errors="replace")
-    assertions = check_headline_assertions(tex_text, manifest_raw)
+    assertions = (check_headline_assertions(tex_text, manifest_raw)
+                  + check_scalar_assertions(tex_text, manifest_raw))
     n_fail = sum(1 for _, s, _ in assertions if s == "FAIL")
     n_warn = sum(1 for _, s, _ in assertions if s == "WARN")
 
     print()
     print("=" * 60)
-    print("Headline FDR assertions (manuscript vs manifest)")
+    print("Headline assertions (manuscript vs manifest)")
     print("=" * 60)
     marks = {"PASS": "PASS", "FAIL": "FAIL", "WARN": "WARN"}
     for label, status, detail in assertions:
@@ -339,7 +484,7 @@ def main() -> int:
         print(f"\n[ASSERT] checked assertions pass ({n_warn} warning(s) — "
               f"unverifiable, see above).")
     else:
-        print("\n[ASSERT] all headline FDR counts match the manifest.")
+        print("\n[ASSERT] all headline counts and magnitudes match the manifest.")
 
     # A headline contradiction is a real error: fail hard regardless of --strict.
     if n_fail:
