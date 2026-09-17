@@ -55,7 +55,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.manifest import get  # noqa: E402
+from src.manifest import get, record  # noqa: E402
 
 DATA = ROOT / "data" / "processed"
 OUT  = DATA / "conformal_gate.parquet"
@@ -204,6 +204,19 @@ def main():
               f"net SR {ungated['net_sr']:.3f}→{g['net_sr']:.3f} "
               f"({'OK' if sr_ok else 'DEGRADED'}), "
               f"verdict={'KEEP' if keep else 'DEMOTE'}")
+
+    # Record, so the supplement's gate figures are manifest-backed rather than
+    # transcribed. This stage wrote only a parquet, which is how its numbers
+    # went stale and then stayed stale behind a guard that aborted the run.
+    for _, r in results.iterrows():
+        v = str(r["variant"])
+        for field in ("net_sr", "gross_sr", "calmar", "max_dd",
+                      "cost_drag_bps", "frac_days_derisked"):
+            record(f"conformal_gate.track_b.{v}.{field}",
+                   round(float(r[field]), 4), stage="conformal_gate", track="B")
+    record("conformal_gate.track_b.m_stressed_v1", round(m_stressed_v1, 4),
+           stage="conformal_gate", track="B",
+           meta={"definition": "IS mean q_hat_calm / q_hat_stressed, Track B"})
     print(f"\nSaved → {OUT}")
 
 
