@@ -220,13 +220,32 @@ def main(argv=None) -> dict:
     log(f"  window          : {start} .. {end}")
     log(f"  window rule     : {window_note}")
 
+    # Prior touches are matched on window and track, NOT on the spec blob.
+    #
+    # Matching on the blob as well looked stricter and was in fact a hole: any
+    # edit to config/spec_v3.yaml, down to a typo in a comment, changes the
+    # hash, and the existing entries then stop matching. The log would still
+    # hold them, the guard would no longer see them, and the window would be
+    # re-scorable with no --reevaluation-reason required. A single-touch
+    # mechanism that a one-character edit disarms is not one.
+    #
+    # The window is what can only be touched once. The blob is recorded so a
+    # reader can tell which specification each touch was scored under, and a
+    # touch under a different blob is reported rather than ignored.
+    touches = load_touch_log()
     prior = [
-        e for e in load_touch_log()
-        if e.get("spec_blob") == blob and e.get("window") == f"{start}..{end}"
-        and e.get("track") == args.track
+        e for e in touches
+        if e.get("window") == f"{start}..{end}" and e.get("track") == args.track
     ]
     if prior:
         log(f"  PRIOR TOUCHES   : {len(prior)} (this window has been scored before)")
+        for e in prior:
+            same = "same spec" if e.get("spec_blob") == blob else "DIFFERENT spec"
+            log(f"     {e.get('scored_at_utc', '?')}  blob={str(e.get('spec_blob'))[:12]}"
+                f"  ({same})")
+        if any(e.get("spec_blob") != blob for e in prior):
+            log("     note: the specification has changed since a previous touch; "
+                "that does not reset the count.")
 
     if args.dry_run:
         log("\n  dry run: nothing scored.")
