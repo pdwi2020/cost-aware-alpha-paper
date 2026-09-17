@@ -112,7 +112,7 @@ for f in 00_READ_FIRST.md 00_READ_FIRST.pdf 00_READ_FIRST.docx \
          response_to_reviewers.pdf response_to_reviewers.docx \
          cover_letter.pdf cover_letter.docx \
          highlights.pdf graphical_abstract.pdf \
-         spec_v3.yaml forward_touch_log.json; do
+         spec_v3.yaml spec_v3_errata.md forward_touch_log.json; do
     [ -f "$KIT/$f" ] || fail "review package: $f missing"
     cp "$KIT/$f" "$REV/$f"
 done
@@ -128,7 +128,7 @@ for f in main.pdf supplementary.pdf latexdiff_vs_array.pdf \
          response_to_reviewers_DRAFT.md \
          cover_letter.pdf cover_letter.docx cover_letter_DRAFT.md \
          highlights.pdf graphical_abstract.pdf \
-         spec_v3.yaml forward_touch_log.json \
+         spec_v3.yaml spec_v3_errata.md forward_touch_log.json \
          README.md TASKS.md response_matrix.md prior_work_matrix.md \
          build_kit.sh; do
     [ -f "$KIT/$f" ] && cp "$KIT/$f" "$SUB/$f"
