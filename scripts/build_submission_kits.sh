@@ -84,6 +84,13 @@ for doc in main supplementary; do
     [ "$undef" -eq 0 ] || fail "$doc has undefined references in the kit build"
 done
 
+# --- 3b. The letters cite manuscript numbers literally --------------------
+# Adding one table renumbers every table after it and silently invalidates the
+# letters' citations. Three of them were wrong that way, each pointing an editor
+# at the wrong table while checking whether a reviewer's point was addressed.
+say "checking the letters' cross-references against the compiled manuscript"
+python3 tools/check_crossrefs.py || fail "a letter cites a table, section or figure that does not resolve"
+
 # --- 4. Refresh the kit directory's built artefacts -----------------------
 say "refreshing built artefacts in $KIT"
 for f in main.pdf supplementary.pdf latexdiff_vs_array.pdf; do
