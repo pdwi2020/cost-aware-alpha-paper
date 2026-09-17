@@ -28,7 +28,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible  # noqa: E402
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0  # noqa: E402
+from src.manifest import record  # noqa: E402
 from src.backtest.run_backtest import (  # noqa: E402
     build_returns_vol_adv, SIG_A_PATH, OHLCV_PATH, FEAT_PATH, CFG_PATH,
     BACKTEST_START, BACKTEST_END,
@@ -53,8 +54,7 @@ def main():
     )
 
     sim = PortfolioSimulator(config_path=str(CFG_PATH), spread_bps=3.0, impact_coeff=0.10)
-    W = sim.signal_to_positions(signal_df, lag=1, rebal_freq=REBAL_FREQ)
-    W = apply_s0_eligible(W, feat_df).fillna(0.0)
+    W = build_positions_screen0(signal_df, feat_df, sim, REBAL_FREQ).fillna(0.0)
 
     prev = W.shift(1).fillna(0.0)
     curr = W
@@ -93,6 +93,20 @@ def main():
     ]
     df = pd.DataFrame(rows)
     df.to_parquet(OUT, index=False)
+
+    # Record. This stage wrote only a parquet, so its manifest entries sat at a
+    # July vintage (total 20.35x) while the stage itself produced 25.86x and the
+    # manuscript quoted the latter. The numbers agreed by luck, not by wiring.
+    record("backtest.track_a.turnover.total_annual", round(float(tot), 4),
+           stage="turnover_decomp", track="A")
+    record("backtest.track_a.turnover.signal_driven_annual", round(float(sig), 4),
+           stage="turnover_decomp", track="A")
+    record("backtest.track_a.turnover.rebalancing_driven_annual", round(float(reb), 4),
+           stage="turnover_decomp", track="A")
+    record("backtest.track_a.turnover.signal_driven_frac", round(float(frac_sig), 4),
+           stage="turnover_decomp", track="A")
+    record("backtest.track_a.turnover.rebalancing_driven_frac", round(float(frac_reb), 4),
+           stage="turnover_decomp", track="A")
 
     print(f"  Rebalance days with trades: {int((daily_total>0).sum())}")
     print(f"  Total annualised turnover      : {tot:6.2f}x")

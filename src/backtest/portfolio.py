@@ -122,6 +122,40 @@ def apply_s0_daily_exit(
     return positions.where(elig_wide, 0.0)
 
 
+def build_positions_screen0(
+    signal: pd.DataFrame,
+    feat_df: pd.DataFrame,
+    sim: "PortfolioSimulator",
+    rebal_freq: int,
+    lag: int = 1,
+) -> pd.DataFrame:
+    """Build positions under the Screen 0 rule the specification actually states.
+
+    spec v3, ``screen0.position_rule``: mask ineligible names in the SIGNAL
+    before z-scoring, gross normalisation and the water-fill cap, then exit
+    ineligible holdings daily WITHOUT renormalising.
+
+    This exists because that rule was implemented once, in ``books.py``, and
+    every other stage went on calling the deprecated ``apply_s0_eligible``,
+    which masks after sizing and renormalises the survivors. The two give
+    materially different books on the same signal: the post-hoc path breached
+    the 5% position cap on 10.7% of days and reported an in-sample gross Sharpe
+    of 0.399 against this rule's 0.302. Routing every caller through one
+    function is the only way to keep them from diverging again.
+    """
+    if "s0_eligible" not in feat_df.columns:
+        raise ValueError(
+            "build_positions_screen0: features panel has no 's0_eligible' "
+            "column, so Screen 0 cannot be applied. The underlying helpers "
+            "only warn and pass the signal through unchanged, which produces "
+            "an unscreened book that looks like a screened one. Rebuild the "
+            "panel with build_features.py rather than proceeding."
+        )
+    masked = mask_signal_screen0(signal, feat_df)
+    positions = sim.signal_to_positions(masked, lag=lag, rebal_freq=rebal_freq)
+    return apply_s0_daily_exit(positions, feat_df)
+
+
 class PortfolioSimulator:
     """Simulate strategy P&L with spread, participation, and borrow costs."""
 

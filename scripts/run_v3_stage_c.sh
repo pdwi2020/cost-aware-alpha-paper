@@ -41,7 +41,13 @@ UPSTREAM="data/processed/fdr_results.parquet"
 
 run_stage() {
     local name="$1" limit="$2" output="$3"; shift 3
-    if [ "$output" != "-" ] && [ -s "$output" ] && [ "$output" -nt "$UPSTREAM" ]; then
+    # Freshness is judged against the upstream data AND the stage's own source.
+    # Judging on data alone let a Screen 0 position-rule correction land in the
+    # code while every stage here skipped, so the battery went on reporting
+    # books built by the rule that had just been replaced.
+    local script="$1"
+    if [ "$output" != "-" ] && [ -s "$output" ] \
+       && [ "$output" -nt "$UPSTREAM" ] && [ "$output" -nt "$script" ]; then
         say "skip $name (fresh output present: $output)"
         return 0
     fi

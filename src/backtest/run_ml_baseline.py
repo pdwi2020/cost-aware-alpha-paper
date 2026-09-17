@@ -50,7 +50,7 @@ from src.models.model_suite import (
     preprocess,
 )
 from src.features.feature_spec import feature_columns as _feature_columns
-from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 from src.backtest.run_holdout import (
     build_returns_vol_adv_holdout,
     SANITIZE_CAP,
@@ -315,11 +315,11 @@ def run_backtest_window(signal_wide, ohlcv, feat_df, start, end, cfg, label):
         impact_coeff=cfg["impact_coeff"],
     )
 
-    positions = sim.signal_to_positions(signal_wide, lag=1, rebal_freq=REBAL_FREQ)
-
     # Screen 0 (look-ahead-free) — see src/data/screen0.py
-    n_before = int((positions.abs() > 1e-12).sum().sum())
-    positions = apply_s0_eligible(positions, feat_df)
+    n_before = int(
+        (sim.signal_to_positions(signal_wide, lag=1, rebal_freq=REBAL_FREQ).abs() > 1e-12).sum().sum()
+    )
+    positions = build_positions_screen0(signal_wide, feat_df, sim, REBAL_FREQ)
     n_after = int((positions.abs() > 1e-12).sum().sum())
     log(f"  [{label}] Screen 0 (lagged price≥$5, ADV≥$1M, PIT member): {n_before} → {n_after} active positions")
 

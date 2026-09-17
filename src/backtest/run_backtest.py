@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 
 SIG_A_PATH  = ROOT / "data" / "processed" / "signals_track_a.parquet"
 SIG_B_PATH  = ROOT / "data" / "processed" / "signals_track_b.parquet"
@@ -132,10 +132,12 @@ def run_single_backtest(
         spread_bps=spread_bps,
         impact_coeff=impact_coeff,
     )
-    positions = sim.signal_to_positions(signal_df, lag=1)
-    # Screen 0 (look-ahead-free) — see src/data/screen0.py
+    # Screen 0 (look-ahead-free) — see src/data/screen0.py. Masked in the
+    # signal before sizing, per spec v3 screen0.position_rule.
     if feat_df is not None:
-        positions = apply_s0_eligible(positions, feat_df)
+        positions = build_positions_screen0(signal_df, feat_df, sim, rebal_freq=1)
+    else:
+        positions = sim.signal_to_positions(signal_df, lag=1)
     pnl_df    = sim.simulate_pnl(positions, returns, vol=vol,
                                   adv_dollars=adv_dollars, aum_dollars=aum_dollars,
                                   min_adv_dollars=min_adv_dollars)

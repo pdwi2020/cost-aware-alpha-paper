@@ -12,8 +12,7 @@ import pandas as pd
 from src.backtest.generate_signals import generate_composite_signal
 from src.backtest.portfolio import (
     PortfolioSimulator,
-    apply_s0_daily_exit,
-    mask_signal_screen0,
+    build_positions_screen0,
 )
 from src.backtest.run_backtest import build_returns_vol_adv
 
@@ -70,9 +69,7 @@ def _run_book_pipeline(
     borrow_bps_matrix: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Apply Screen 0, form positions, simulate costs, and slice the result."""
-    masked = mask_signal_screen0(raw_signal, feat_df)
-    positions = sim.signal_to_positions(masked, lag=1, rebal_freq=rebal_freq)
-    positions = apply_s0_daily_exit(positions, feat_df)
+    positions = build_positions_screen0(raw_signal, feat_df, sim, rebal_freq)
 
     returns, sigma, adv = panel
     # Features with partial history (e.g. corr_XLC: the XLC sector ETF only

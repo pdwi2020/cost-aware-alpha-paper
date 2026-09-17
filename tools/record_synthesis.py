@@ -183,7 +183,11 @@ def record_rebal_grid() -> None:
     fields = (("gross_pnl_sharpe", "is_gross_sharpe"),
               ("net_pnl_sharpe", "is_net_sharpe"),
               ("annual_turnover", "is_annual_turnover"),
-              ("cost_drag_bps", "is_cost_drag_bps"))
+              ("cost_drag_bps", "is_cost_drag_bps"),
+              # Net annual return in percent: the table's fifth column, which
+              # had no manifest source either. The parquet stores it as a
+              # fraction, so it is scaled on the way in.
+              ("net_pnl_annual", "is_net_annual_pct"))
     written = 0
     for row in base.itertuples():
         freq = suffix.get(int(row.rebal_freq))
@@ -191,7 +195,8 @@ def record_rebal_grid() -> None:
             continue
         for field, stem in fields:
             key = f"backtest.{row.track}.{stem}_{freq}"
-            value = round(float(getattr(row, field)), 4)
+            raw = float(getattr(row, field))
+            value = round(raw * 100.0, 4) if field == "net_pnl_annual" else round(raw, 4)
             existing = manifest.get(key)
             if freq != "monthly" and existing is not None and existing != value:
                 raise ValueError(
@@ -330,6 +335,39 @@ def record_synthesis() -> None:
           f"(p={locked_p:.2f}, {klass})")
 
 
+def record_window_net_annual() -> None:
+    """Annualised net return per window, from each window's own daily P&L.
+
+    tab:oos prints this column, and no stage recorded it, so the four cells
+    were hand-typed. Deriving them from the P&L the window stage writes keeps
+    the column tied to the same series as the Sharpe beside it.
+    """
+    sources = {
+        "window.locked_oos_2025.track_a": "holdout_pnl_track_a.parquet",
+        "window.locked_oos_2025.track_b": "holdout_pnl_track_b.parquet",
+        "window.exploratory_2022_2024.track_a":
+            "holdout_pnl_exploratory_2022_2024_track_a.parquet",
+        "window.exploratory_2022_2024.track_b":
+            "holdout_pnl_exploratory_2022_2024_track_b.parquet",
+        "forward.track_a": "forward_pnl_track_a.parquet",
+    }
+    written = 0
+    for stem, fname in sources.items():
+        path = PROC / fname
+        if not path.exists():
+            print(f"  skip {stem}: {fname} not present")
+            continue
+        pnl = pd.read_parquet(path)
+        value = round(float(pnl["net_pnl"].mean()) * 252 * 100, 4)
+        manifest.record(
+            f"{stem}.net_annual_pct", value, stage="window",
+            track=stem.rsplit("_", 1)[-1].upper() if stem.endswith(("_a", "_b")) else None,
+            meta={"source": fname, "n_days": int(len(pnl))},
+        )
+        written += 1
+    print(f"  window net annual %% recorded: {written} key(s)")
+
+
 def main() -> int:
     print("=== recording walk-forward IC ===")
     record_walk_forward_ic()
@@ -339,6 +377,7 @@ def main() -> int:
     record_rebal_grid()
     drop_superseded()
     record_forward_holdout()
+    record_window_net_annual()
     print("=== recording baselines ===")
     record_baselines()
     print("=== recording synthesis ===")

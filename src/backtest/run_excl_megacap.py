@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 from src.backtest.generate_signals import build_signal_weights, generate_composite_signal
 
 FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
@@ -180,10 +180,11 @@ def main():
         tickers    = sig.columns.tolist()
         returns, vol, adv, close_px = build_returns_vol_adv(ohlcv_excl, tickers, HOLDOUT_START, HOLDOUT_END)
 
-        positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
         # Screen 0 (look-ahead-free) — see src/data/screen0.py
-        n_before = int((positions.abs() > 1e-12).sum().sum())
-        positions = apply_s0_eligible(positions, feat_df_excl)
+        n_before = int(
+            (sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ).abs() > 1e-12).sum().sum()
+        )
+        positions = build_positions_screen0(sig, feat_df_excl, sim, REBAL_FREQ)
         n_after = int((positions.abs() > 1e-12).sum().sum())
         log(f"  Screen 0 (lagged price≥$5, ADV≥$1M, PIT member): {n_before}→{n_after} active positions")
         pnl_df    = sim.simulate_pnl(

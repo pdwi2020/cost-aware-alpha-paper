@@ -22,7 +22,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible  # noqa: E402
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0  # noqa: E402
 from src.backtest.run_backtest import (  # noqa: E402
     build_returns_vol_adv,
     SIG_A_PATH,
@@ -59,8 +59,7 @@ def main():
         config_path=str(CFG_PATH), spread_bps=BASE_SPREAD, impact_coeff=BASE_IMPACT,
     )
     # Positions depend only on the signal + rebal schedule, not on AUM -> build once.
-    positions = sim.signal_to_positions(signal_df, lag=1, rebal_freq=REBAL_FREQ)
-    positions = apply_s0_eligible(positions, feat_df)
+    positions = build_positions_screen0(signal_df, feat_df, sim, REBAL_FREQ)
 
     rows = []
     for aum in AUM_LEVELS:

@@ -19,8 +19,34 @@ cd "$(dirname "$0")/../paper"
 OLD="main.tex.array_submitted.bak"
 NEW="main.tex"
 DIFF="latexdiff_vs_array.tex"
+FLAT="latexdiff_new_flat.tex"
 
 [ -f "$OLD" ] || { echo "ABORT: $OLD missing (the Array baseline)"; exit 1; }
+
+# The generated tables live in \input files now, and the Array baseline has them
+# inline. Diffing a 30-line table against a one-line \input tells the reviewer
+# nothing and produces markup wrapped around whole table environments, which is
+# the one thing the repair pass below cannot fix. Splice the generated tables in
+# first, so both sides are compared row by row as they were before.
+echo "[0/3] flattening generated tables into the new source"
+python3 - "$NEW" "$FLAT" <<'FLATTEN'
+import re, sys
+from pathlib import Path
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+text = src.read_text()
+def splice(m):
+    name = m.group(1)
+    f = src.parent / (name if name.endswith(".tex") else name + ".tex")
+    # Only the generated tables; macro files must stay as \input so the
+    # preamble still defines them once.
+    if name.startswith("tab_") and f.exists():
+        return f.read_text().rstrip("\n")
+    return m.group(0)
+text = re.sub(r"\\input\{([^}]+)\}", splice, text)
+dst.write_text(text)
+print(f"  wrote {dst.name}")
+FLATTEN
+NEW="$FLAT"
 
 echo "[1/3] latexdiff"
 latexdiff --disable-citation-markup \
@@ -73,6 +99,35 @@ lines = "\n".join(out).split("\n")
 if hoisted or dropped_rules:
     print(f"  hoisted {hoisted} rule(s) out of DIF groups, "
           f"dropped {dropped_rules} in deleted tables")
+
+# \multicolumn must be the first token in its cell. latexdiff happily puts a
+# \DIFaddendFL, or an empty \DIFaddFL{}, in front of one, and TeX then reports
+# "Misplaced \omit" from inside \multispan. Clear the markers that precede the
+# first \multicolumn on a line; the markup is cosmetic, the alignment is not.
+MC_PREFIX = re.compile(
+    r"^((?:\s*(?:\\DIF(?:add|del)(?:begin|end)FL|\\DIF(?:add|del)FL\{\s*\}))+)\s*"
+    r"(?=\\multicolumn)"
+)
+MC_INLINE = re.compile(r"\\DIF(?:add|del)FL\{\s*\}\s*(?=\\multicolumn)")
+OPEN_EMPTY = re.compile(r"\\DIF(?:add|del)FL\{\s*$")
+mc_fixed = 0
+for i, line in enumerate(lines):
+    if r"\multicolumn" not in line:
+        continue
+    # The empty group can straddle a line break: "\DIFaddFL{" ends one line and
+    # the matching "}" opens the next, immediately before \multicolumn.
+    if i and line.lstrip().startswith("}") and OPEN_EMPTY.search(lines[i - 1]):
+        lines[i - 1] = OPEN_EMPTY.sub("", lines[i - 1])
+        line = line.lstrip()[1:]
+        lines[i] = line
+        mc_fixed += 1
+    new_line = MC_PREFIX.sub("", line)
+    new_line = MC_INLINE.sub("", new_line)
+    if new_line != line:
+        lines[i] = new_line
+        mc_fixed += 1
+if mc_fixed:
+    print(f"  cleared DIF markers before {mc_fixed} \\multicolumn cell(s)")
 
 for i, line in enumerate(lines):
     m = RULE.match(line)

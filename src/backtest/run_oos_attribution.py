@@ -1,9 +1,13 @@
-"""B2b — OOS return attribution by feature group for Track B (2022-2024).
+"""Feature-group return attribution: standalone and leave-one-group-out.
 
-Addresses referee point M5: the IS→OOS sign-flip mechanism (§9.4) is narrative.
-This script produces a quantified per-group P&L decomposition.
+Defaults to the attribution the manuscript reports, Track A in sample
+(Section 12.6 and Supplementary Table S6). It previously hard-coded Track B
+over 2022-2024, which is what an older referee point asked for, while the
+supplement table it fed was captioned Track A in-sample and carried Track A's
+in-sample Sharpe in its total row. The target is now an argument, so the table
+and the run cannot disagree about which book is being decomposed.
 
-Feature groups (BH-selected Track B features, grouped by economic theme):
+Feature groups (the BH-selected features of the target track, by economic theme):
   Momentum            : mom_12_1, ret_1d, ret_5d, ret_21d, ret_63d, ret_252d
   Sector-crowding     : corr_SPY, corr_QQQ, corr_XLK, corr_XLE, corr_XLF, ...
   Liquidity / vol     : amihud, roll_spread, vol_21d, sharpe_21d, vol_sig_ratio,
@@ -21,7 +25,7 @@ Two modes (both reported):
 
 Inputs:
     data/processed/features_all.parquet     (MultiIndex: ticker×date, 40 cols)
-    data/processed/fdr_results.parquet      (feature, track, mean_ic, rejected)
+    data/processed/fdr_results.parquet      (feature, track, ic_bar, bh_rejected)
     data/processed/shap_summary.parquet     (feature, model, track, mean_abs_shap)
     data/processed/daily_ohlcv.parquet      (ticker, date, close, volume, …)
     configs/backtest.yaml
@@ -46,7 +50,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator, apply_s0_eligible
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 from src.features.feature_spec import feature_columns as _feature_columns
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -57,14 +61,15 @@ OHLCV_PATH = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
 CFG_PATH   = ROOT / "configs" / "backtest.yaml"
 OUT        = ROOT / "data" / "processed" / "oos_attribution.parquet"
 
-OOS_START  = "2022-01-01"
-OOS_END    = "2024-12-31"
+# Defaults: the Track A in-sample attribution the manuscript reports.
+OOS_START  = "2013-01-01"
+OOS_END    = "2021-12-31"
 REBAL_FREQ = 5
 VOL_WINDOW = 21
-TRACK      = "track_b"
+TRACK      = "track_a"
 ANN        = 252.0
 
-# Screen 0 (look-ahead-free) — see src/data/screen0.py and portfolio.apply_s0_eligible.
+# Screen 0 (look-ahead-free) — see src/data/screen0.py and portfolio.build_positions_screen0.
 # MIN_PRICE removed: apply_min_price_filter (which used trade-date close) was look-ahead.
 SANITIZE_CAP = 0.50
 
@@ -88,7 +93,7 @@ _GROUP_LONG_TEMPLATES = {
     "Sector":        "Sector-crowding",
     "Liq/Vol":       "Liquidity / volatility",
     "MacroInteract": "Macro-interaction (beta × macro)",
-    "Full":          "Full Track B (BH-selected)",
+    "Full":          "Full book (BH-selected)",
 }
 
 
@@ -133,10 +138,16 @@ def run_variant(label: str, mode: str, feat_subset: list, oos_feat: pd.DataFrame
         log(f"  SKIP {label}: no common tickers")
         return None
 
-    positions = sim.signal_to_positions(sig_wide[common_t], lag=1, rebal_freq=REBAL_FREQ)
-    # Screen 0 (look-ahead-free) — see src/data/screen0.py
+    # Screen 0 (look-ahead-free) — see src/data/screen0.py. Masked in the
+    # signal before sizing, per spec v3 screen0.position_rule.
     if screen0_feat is not None:
-        positions = apply_s0_eligible(positions, screen0_feat)
+        positions = build_positions_screen0(
+            sig_wide[common_t], screen0_feat, sim, REBAL_FREQ
+        )
+    else:
+        positions = sim.signal_to_positions(
+            sig_wide[common_t], lag=1, rebal_freq=REBAL_FREQ
+        )
     pnl = sim.simulate_pnl(
         positions,
         returns[common_t].clip(lower=-SANITIZE_CAP, upper=SANITIZE_CAP),
@@ -161,7 +172,7 @@ def run_variant(label: str, mode: str, feat_subset: list, oos_feat: pd.DataFrame
 
 def main():
     t0 = time.time()
-    log("=== B2b OOS Return Attribution ===\n")
+    log(f"=== Feature-Group Attribution: {TRACK}, {OOS_START} to {OOS_END} ===\n")
 
     with open(CFG_PATH) as f:
         cfg = yaml.safe_load(f)
@@ -182,7 +193,7 @@ def main():
         feat_df.index = feat_df.index.set_levels(new_levels)
 
     fdr_b       = fdr_df[fdr_df.track == TRACK]
-    bh_features = fdr_b.loc[fdr_b.rejected, "feature"].tolist()
+    bh_features = fdr_b.loc[fdr_b.bh_rejected, "feature"].tolist()
     bh_set      = set(bh_features)
 
     # Build GROUP_MAP by intersecting templates with actual BH-selected features.
@@ -213,7 +224,8 @@ def main():
         if gname != "Full":
             log(f"  Group {gname!r} ({len(ms)} features): {ms}")
 
-    fdr_sign = {r.feature: float(np.sign(r.mean_ic)) for _, r in fdr_b[fdr_b.rejected].iterrows()}
+    fdr_sign = {r.feature: float(np.sign(r.ic_bar))
+                for _, r in fdr_b[fdr_b.bh_rejected].iterrows()}
 
     shap_b   = shap_df[(shap_df.track == TRACK) & (shap_df.model.isin(["xgb", "lgbm"]))]
     shap_agg = shap_b.groupby("feature")["mean_abs_shap"].mean()

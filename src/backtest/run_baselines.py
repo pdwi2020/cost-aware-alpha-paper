@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 from src.backtest.generate_signals import build_signal_weights, generate_composite_signal
 
 OHLCV_PATH  = ROOT / "data" / "processed" / "daily_ohlcv_v3.parquet"
@@ -192,9 +192,20 @@ def compute_sharpe(r):
     return float(s.mean() / sd * np.sqrt(252)) if sd > 1e-10 else np.nan
 
 
-def run_ls_strategy(signals, returns, vol, adv, cfg, sim, label, period):
-    """Run L/S strategy through PortfolioSimulator, return metrics dict."""
-    positions = sim.signal_to_positions(signals, lag=1, rebal_freq=REBAL_FREQ)
+def run_ls_strategy(signals, returns, vol, adv, cfg, sim, label, period,
+                    feat_df=None):
+    """Run L/S strategy through PortfolioSimulator, return metrics dict.
+
+    The manuscript states Screen 0 is applied uniformly to every strategy, and
+    the baselines are the comparison the verdict is read against, so they have
+    to face the same eligibility filter Track A does. Pass ``feat_df`` to apply
+    it; without it the book is unscreened and the comparison is not like for
+    like.
+    """
+    if feat_df is not None:
+        positions = build_positions_screen0(signals, feat_df, sim, REBAL_FREQ)
+    else:
+        positions = sim.signal_to_positions(signals, lag=1, rebal_freq=REBAL_FREQ)
     min_adv   = cfg.get("min_adv_dollars", 1e6)
     aum       = cfg.get("aum_dollars", 1e8)
     pnl = sim.simulate_pnl(positions, returns, vol=vol,
@@ -371,7 +382,7 @@ def main():
         mom_sig = mom_sig[common]
         mom_m, mom_pnl = run_ls_strategy(
             mom_sig, returns[common], vol[common], adv[common],
-            cfg, sim_cost, "Momentum L/S (12-1)", period
+            cfg, sim_cost, "Momentum L/S (12-1)", period, feat_df=feat_df
         )
         mom_pnl["strategy"] = "Momentum L/S (12-1)"
         mom_pnl["period"]   = period
@@ -386,7 +397,7 @@ def main():
         rev_sig = rev_sig[common_r]
         rev_m, rev_pnl = run_ls_strategy(
             rev_sig, returns[common_r], vol[common_r], adv[common_r],
-            cfg, sim_cost, "Reversal L/S (5d)", period
+            cfg, sim_cost, "Reversal L/S (5d)", period, feat_df=feat_df
         )
         rev_pnl["strategy"] = "Reversal L/S (5d)"
         rev_pnl["period"]   = period
@@ -402,7 +413,7 @@ def main():
             ret_b  = returns.reindex(columns=tickers_b).fillna(0)
             vol_b  = vol.reindex(columns=tickers_b).fillna(0.02)
             adv_b  = adv.reindex(columns=tickers_b).fillna(1e8)
-            positions_b = sim_free.signal_to_positions(sig_b, lag=1, rebal_freq=REBAL_FREQ)
+            positions_b = build_positions_screen0(sig_b, feat_df, sim_free, REBAL_FREQ)
             pnl_b = sim_free.simulate_pnl(positions_b, ret_b, vol=vol_b,
                                            adv_dollars=adv_b,
                                            aum_dollars=cfg.get("aum_dollars", 1e8),

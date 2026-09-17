@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 import src.manifest as manifest
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 from src.backtest.oos_inference import window_inference
 from src.backtest.generate_signals import (
     build_signal_weights,
@@ -176,31 +176,19 @@ def main(argv=None):
             spread_bps=cfg["spread_bps"],
             impact_coeff=cfg["impact_coeff"],
         )
-        positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
-
-        # Screen 0 (look-ahead-free): load the pre-computed eligibility flag
-        # from features_all.parquet.  s0_eligible at date t was computed from
+        # Screen 0 (look-ahead-free): s0_eligible at date t was computed from
         # price[t-1] and trailing ADV[t-window:t-1] in build_features.py via
-        # src/data/screen0.py — all information known before the open at t.
-        # We zero out positions for ineligible names and renormalise L1 gross
-        # among the ELIGIBLE names only (so deployed capital is unchanged).
-        n_before = int((positions.abs() > 1e-12).sum().sum())
-        if "s0_eligible" in feat_df.columns:
-            # Build a (date × ticker) boolean mask from the MultiIndex parquet
-            elig_col = feat_df["s0_eligible"]
-            if not isinstance(elig_col.index, pd.MultiIndex):
-                elig_col = elig_col.set_index(["ticker", "date"]) if "ticker" in feat_df.columns else elig_col
-            elig_wide = elig_col.unstack(level="ticker")  # date × ticker
-            elig_wide = elig_wide.reindex(index=positions.index, columns=positions.columns)
-            elig_wide = elig_wide.fillna(False).astype(bool)
-            positions = positions.where(elig_wide, 0.0)
-            # Renormalise L1 gross among eligible names so capital stays deployed
-            l1 = positions.abs().sum(axis=1).replace(0.0, np.nan)
-            positions = positions.div(l1, axis=0).fillna(0.0)
-        else:
-            log("  [warn] s0_eligible column not found in features parquet; "
-                "rebuild with build_features.py to enable look-ahead-free Screen 0. "
-                "Proceeding without Screen 0 filter.")
+        # src/data/screen0.py, so no trade-date information is used.
+        #
+        # This block used to hold its own copy of the post-hoc rule: mask after
+        # sizing, then renormalise the survivors. That is not the rule spec v3
+        # states, and renormalising breached the position cap. It now calls the
+        # one shared implementation, so this window and the forward window are
+        # built the same way.
+        n_before = int(
+            (sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ).abs() > 1e-12).sum().sum()
+        )
+        positions = build_positions_screen0(sig, feat_df, sim, REBAL_FREQ)
         n_after = int((positions.abs() > 1e-12).sum().sum())
         log(f"  Screen 0 (lagged price≥$5, ADV≥$1M, PIT member): "
             f"{n_before}→{n_after} active positions")

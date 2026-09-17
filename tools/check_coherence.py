@@ -385,6 +385,105 @@ def check_headline_assertions(
     return results
 
 
+TA_FDR_ROW = re.compile(
+    r"\\texttt\{([A-Za-z0-9\\_]+)\}\s*&\s*\$(-?[0-9.]+)\$\s*&\s*"
+    r"\$([0-9.]+)\$\s*&\s*\$([0-9.]+)\$\s*&",
+)
+
+
+def check_ta_fdr_table(tex_text: str, manifest_raw: dict) -> list:
+    """Pin every printed cell of the TA-FDR table to the run that produced it.
+
+    The counts alone were pinned before, and they are 0/30 under both the valid
+    and the invalid null, so the table went on printing the superseded run's
+    per-feature p-values through a clean check. Each cell is compared here.
+    """
+    results = []
+    entry = manifest_raw.get("ta_fdr.track_a.per_feature")
+    if entry is None:
+        return [("TA-FDR per-feature table", "WARN",
+                 "ta_fdr.track_a.per_feature missing from the manifest")]
+    by_feature = {r["feature"]: r for r in entry.get("value", [])}
+
+    rows = TA_FDR_ROW.findall(tex_text)
+    if not rows:
+        return [("TA-FDR per-feature table", "WARN",
+                 "no table rows matched; has the table format changed?")]
+
+    for raw_name, mean_net, p_net, p_gross in rows:
+        feature = raw_name.replace("\\_", "_")
+        src = by_feature.get(feature)
+        if src is None:
+            continue  # a row from some other table that happens to match
+        checks = (
+            ("mean net (bps)", float(mean_net), src["mean_net"] * 1e4, 3),
+            ("p_net", float(p_net), src["p_net"], 3),
+            ("p_blind", float(p_gross), src["p_gross"], 3),
+        )
+        for what, shown, actual, decimals in checks:
+            if round(shown, decimals) == round(actual, decimals):
+                results.append((f"tab:ta_fdr {feature} {what}", "PASS",
+                                f"manuscript shows {shown}, run says "
+                                f"{round(actual, decimals)}"))
+            else:
+                results.append((f"tab:ta_fdr {feature} {what}", "FAIL",
+                                f"manuscript shows {shown}, run says "
+                                f"{round(actual, decimals)}"))
+    return results
+
+
+def read_tex_with_inputs(path: Path) -> str:
+    """Return the manuscript with its \\input files spliced in.
+
+    Assertions anchor on table rows, and the generated tables live in their own
+    files. Reading main.tex alone left every generated table unguarded, which
+    is how Table 6 kept printing a superseded vintage's p-values while the
+    checker reported a clean run.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for name in re.findall(r"^\s*\\input\{([^}]+)\}", text, flags=re.M):
+        child = path.parent / (name if name.endswith(".tex") else name + ".tex")
+        if child.exists():
+            text += "\n% ---- spliced from " + child.name + " ----\n"
+            text += child.read_text(encoding="utf-8", errors="replace")
+    return text
+
+
+GENERATED_TEX = [
+    "tab_ta_fdr.tex", "tab_rebal.tex", "tab_oos.tex",
+    "tab_capacity.tex", "tab_baselines.tex", "tab_search_adjusted.tex",
+    "generated_numbers.tex", "ta_fdr_macros.tex", "search_adjusted_macros.tex",
+]
+
+
+def check_generated_freshness(tex_path: Path, manifest_path: Path) -> list:
+    """Fail if a generated artefact predates the manifest it renders.
+
+    Converting the hand-typed tables into generated ones removed the drift that
+    the value assertions used to catch, and with it the assertions themselves,
+    which now match nothing. The risk that remains is different: a re-run
+    updates the manifest and nobody regenerates the tables, so the paper
+    silently renders the previous vintage. That is what this checks.
+    """
+    results = []
+    if not manifest_path.exists():
+        return [("generated artefacts", "WARN", "no manifest to compare against")]
+    m_mtime = manifest_path.stat().st_mtime
+    for name in GENERATED_TEX:
+        f = tex_path.parent / name
+        if not f.exists():
+            results.append((f"generated {name}", "WARN", "not present"))
+            continue
+        if f.stat().st_mtime >= m_mtime:
+            results.append((f"generated {name}", "PASS", "newer than the manifest"))
+        else:
+            age = (m_mtime - f.stat().st_mtime) / 60.0
+            results.append((f"generated {name}", "FAIL",
+                            f"{age:.0f} min older than the manifest; "
+                            f"re-run its generator"))
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Check numeric coherence between manuscript and manifest."
@@ -464,9 +563,11 @@ def main() -> int:
 
     # --- Headline assertion cross-checks (hard guard against manifest drift) ---
     manifest_raw = load_manifest_raw(args.manifest)
-    tex_text = args.tex.read_text(encoding="utf-8", errors="replace")
+    tex_text = read_tex_with_inputs(args.tex)
     assertions = (check_headline_assertions(tex_text, manifest_raw)
-                  + check_scalar_assertions(tex_text, manifest_raw))
+                  + check_scalar_assertions(tex_text, manifest_raw)
+                  + check_ta_fdr_table(tex_text, manifest_raw)
+                  + check_generated_freshness(args.tex, args.manifest))
     n_fail = sum(1 for _, s, _ in assertions if s == "FAIL")
     n_warn = sum(1 for _, s, _ in assertions if s == "WARN")
 

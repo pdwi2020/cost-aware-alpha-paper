@@ -30,7 +30,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
 FDR_PATH   = ROOT / "data" / "processed" / "fdr_results.parquet"
@@ -221,7 +221,7 @@ def main():
             log("  ERROR: no common tickers!")
             continue
 
-        positions = sim.signal_to_positions(sig_wide[common_t], lag=1, rebal_freq=REBAL_FREQ)
+        positions = build_positions_screen0(sig_wide[common_t], feat_df, sim, REBAL_FREQ)
         pnl = sim.simulate_pnl(
             positions,
             returns[common_t],

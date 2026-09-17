@@ -68,6 +68,12 @@ if ! bash scripts/run_v3_stage_b.sh > "$LOG_DIR/stage_b_driver.log" 2>&1; then
 fi
 say "=== stage_b done"
 
+# Stage B runs TA-FDR; its table is rendered here, for the same reason
+# tab_search_adjusted is. Table 6 once held the superseded v2 p-values, the
+# exact numbers a reviewer had cited as evidence the old null was invalid,
+# beside a v3 parquet that disagreed with every one of them.
+step tab_ta_fdr 300 python3 -u tools/gen_tab_ta_fdr.py
+
 say "=== stage_c start"
 if ! bash scripts/run_v3_stage_c.sh > "$LOG_DIR/stage_c_driver.log" 2>&1; then
     say "FAIL: stage_c"; tail -20 "$LOG_DIR/stage_c_driver.log"; exit 1

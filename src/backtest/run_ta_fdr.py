@@ -81,8 +81,10 @@ Applied at q=0.10 (FDR_Q) separately per track and separately on {p_net},
 The v2 outputs are renamed (not deleted):
     data/processed/ta_fdr.parquet             -> ta_fdr.parquet.v2_invalid_null
     data/processed/ta_fdr_oos_metrics.parquet -> ta_fdr_oos_metrics.parquet.v2_invalid_null
-v3 does not call src.manifest.record and does not evaluate anything after
-2021-12-31 (the old OOS 2022-2024 comparison is removed — out of scope here).
+v3 records every quantity the manuscript's TA-FDR table prints (see
+`record_manifest`), overwriting the superseded v2 entries, and does not
+evaluate anything after 2021-12-31 (the old OOS 2022-2024 comparison is
+removed, out of scope here).
 
 Run (slow — B=2000 default, ~30-90 min):
     python3 -u src/backtest/run_ta_fdr.py --B 2000
@@ -112,6 +114,7 @@ from src.backtest import books
 from src.backtest.portfolio import PortfolioSimulator
 from src.fdr.bh_correction import benjamini_hochberg, bhy_procedure
 from src.features.feature_spec import feature_columns as get_feature_columns
+from src.manifest import record
 
 FDR_PATH   = ROOT / "data" / "processed" / "fdr_results.parquet"
 FEAT_PATH  = ROOT / "data" / "processed" / "features_all.parquet"
@@ -664,6 +667,86 @@ def _rename_v2_output(path: Path) -> None:
     log(f"  [rename] {path} -> {target}")
 
 
+def record_manifest(df: pd.DataFrame, per_track_summary: dict, args) -> None:
+    """Write the v3 results to the results manifest.
+
+    v3 originally wrote only a parquet. The manifest kept the v2 entries from
+    the superseded invalid-null run, so Table 6 of the manuscript went on
+    printing v2 p-values beside a v3 parquet that disagreed with them, and the
+    coherence check passed because it pinned only the rejection counts, which
+    are 0/30 under both. Every quantity the table prints is recorded here.
+
+    A partial run (--tracks track_b, or a small --B smoke test) must not
+    overwrite a full run's entries, so recording is skipped unless both tracks
+    ran at the configured B.
+    """
+    if set(args.tracks) != {"track_a", "track_b"}:
+        log(f"\n[manifest] skipped: partial run (tracks={args.tracks})")
+        return
+    if args.B < N_SAMPLES:
+        log(f"\n[manifest] skipped: smoke run (B={args.B} < {N_SAMPLES})")
+        return
+
+    n_features = len(df[df["track"] == "track_a"])
+    threshold_rank1 = FDR_Q / n_features
+
+    record("tafdr.B", int(args.B), stage="ta_fdr")
+    record("tafdr.block_length", int(args.block_length), stage="ta_fdr")
+    record("tafdr.bh_threshold_rank1", threshold_rank1, stage="ta_fdr",
+           meta={"description": "q/m, the BH cutoff the smallest p-value faces"})
+
+    for track in ("track_a", "track_b"):
+        g = df[df["track"] == track]
+        s = per_track_summary[track]
+        label = track.split("_")[1].upper()
+
+        # The net test is the headline; the cost-blind and studentised columns
+        # are recorded beside it so the manuscript cannot quote one and mean
+        # another.
+        record(f"tafdr.{track}.n_selected_bh", s["n_bh_net"], stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.n_selected_bhy", s["n_bhy_net"], stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.n_selected_bh_gross", s["n_bh_gross"], stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.n_selected_bhy_gross", s["n_bhy_gross"], stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.n_selected_bh_stud", s["n_bh_stud"], stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.n_features", n_features, stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.min_p_net", float(g["p_net"].min()), stage="ta_fdr", track=label)
+        record(f"tafdr.{track}.min_p_gross", float(g["p_gross"].min()), stage="ta_fdr", track=label)
+
+        # The v2 namespace is overwritten rather than left beside the v3 one:
+        # a stale key holding invalid p-values is a landmine for any later
+        # reader, and check_coherence still reads ta_fdr.*.summary.
+        record(f"ta_fdr.{track}.summary", {
+            "n_features": n_features,
+            "n_bh_selected": s["n_bh_net"],
+            "n_bhy_selected": s["n_bhy_net"],
+        }, stage="ta_fdr", track=label)
+        record(f"ta_fdr.{track}.null_params", {
+            "null": "recentred_stationary_block_bootstrap_JOINT",
+            "statistic": "mean_net_return",
+            "block_length_days": int(args.block_length),
+            "n_samples": int(args.B),
+            "h0": "E[net return] <= 0",
+            "preserves": ["ticker_autocorrelation", "cross_sectional_dependence"],
+        }, stage="ta_fdr", track=label)
+        record(f"ta_fdr.{track}.per_feature", [
+            {
+                "feature": r.feature,
+                "mean_gross": float(r.mean_gross),
+                "mean_cost": float(r.mean_cost),
+                "mean_net": float(r.mean_net),
+                "ann_net_sharpe": None if pd.isna(r.ann_net_sharpe) else float(r.ann_net_sharpe),
+                "p_net": float(r.p_net),
+                "p_gross": float(r.p_gross),
+                "p_stud": float(r.p_stud),
+                "bh_selected": bool(r.bh_net_selected),
+                "bhy_selected": bool(r.bhy_net_selected),
+            }
+            for r in g.itertuples()
+        ], stage="ta_fdr", track=label)
+
+    log("\n[manifest] recorded v3 TA-FDR entries (tafdr.* and ta_fdr.*)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--B", type=int, default=N_SAMPLES)
@@ -748,6 +831,8 @@ def main():
     OUT_SUMMARY_JSON.parent.mkdir(parents=True, exist_ok=True)
     OUT_SUMMARY_JSON.write_text(json.dumps(summary, indent=2) + "\n")
     log(f"Saved -> {OUT_SUMMARY_JSON}")
+
+    record_manifest(ta_fdr_v3_df, per_track_summary, args)
 
     log("\n=== SUMMARY ===")
     for track in args.tracks:

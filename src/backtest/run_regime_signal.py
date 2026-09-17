@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 
 FDR_PATH    = ROOT / "data" / "processed" / "fdr_results.parquet"
 REGIME_PATH = ROOT / "data" / "processed" / "fdr_regime.parquet"
@@ -198,7 +198,7 @@ def run_variant(
     tickers = sig.columns.tolist()
     returns, vol, adv = build_returns_vol_adv(ohlcv, tickers, HOLDOUT_START, HOLDOUT_END)
 
-    positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
+    positions = build_positions_screen0(sig, feat_df, sim, REBAL_FREQ)
     pnl_df    = sim.simulate_pnl(
         positions, returns, vol=vol,
         adv_dollars=adv,

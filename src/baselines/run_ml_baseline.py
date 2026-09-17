@@ -70,7 +70,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest.portfolio import PortfolioSimulator
+from src.backtest.portfolio import PortfolioSimulator, build_positions_screen0
 from src.features.feature_spec import feature_columns as _feature_columns
 
 # ---------------------------------------------------------------------------
@@ -455,7 +455,9 @@ def main() -> None:
         tickers = sig.columns.tolist()
         returns, vol, adv = build_returns_vol_adv(ohlcv, tickers, win_start, win_end)
 
-        positions = sim.signal_to_positions(sig, lag=1, rebal_freq=REBAL_FREQ)
+        # Screen 0 applied the way spec v3 states, the same as Track A, so the
+        # comparison the verdict is read against is like for like.
+        positions = build_positions_screen0(sig, feat_df, sim, REBAL_FREQ)
         pnl_df    = sim.simulate_pnl(
             positions, returns, vol=vol, adv_dollars=adv,
             aum_dollars=aum_dollars, min_adv_dollars=min_adv,
